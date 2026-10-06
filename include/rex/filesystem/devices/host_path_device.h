@@ -29,6 +29,12 @@ class HostPathDevice : public Device {
   void Dump(string::StringBuffer* string_buffer) override;
   Entry* ResolvePath(const std::string_view path) override;
 
+  // Lays a host folder over the device after Initialize (mods): its files
+  // replace the device's at the same relative paths (matched ignoring case),
+  // or are added. Later overlays win over earlier ones. Returns the number of
+  // files laid over.
+  uint32_t AddOverlay(const std::filesystem::path& overlay_path);
+
   bool is_read_only() const override { return read_only_; }
   // NOTE(tomc): When true, host file handles open with FILE_SHARE_DELETE so an open read
   // handle (e.g. a save-slot preview) does not block an overwrite's
@@ -48,6 +54,7 @@ class HostPathDevice : public Device {
 
  private:
   void PopulateEntry(HostPathEntry* parent_entry);
+  uint32_t OverlayEntry(HostPathEntry* parent_entry, const std::filesystem::path& overlay_folder);
 
   std::string name_;
   std::filesystem::path host_path_;

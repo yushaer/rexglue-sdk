@@ -113,6 +113,63 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
   return current_entry;
 }
 
+uint32_t HostPathDevice::AddOverlay(const std::filesystem::path& overlay_path) {
+  std::error_code error;
+  if (!root_entry_ || !std::filesystem::is_directory(overlay_path, error)) {
+    return 0;
+  }
+  auto global_lock = global_critical_region_.Acquire();
+  return OverlayEntry(static_cast<HostPathEntry*>(root_entry_.get()), overlay_path);
+}
+
+uint32_t HostPathDevice::OverlayEntry(HostPathEntry* parent_entry,
+                                      const std::filesystem::path& overlay_folder) {
+  uint32_t overlaid = 0;
+  for (auto& overlay_info : rex::filesystem::ListFiles(overlay_folder)) {
+    std::string name = rex::path_to_utf8(overlay_info.name);
+    std::filesystem::path overlay_child_path = overlay_folder / overlay_info.name;
+    // The device's entry of the same name, ignoring case.
+    auto existing = std::find_if(
+        parent_entry->children_.begin(), parent_entry->children_.end(),
+        [&](const std::unique_ptr<Entry>& child) {
+          return rex::string::utf8_equal_case(child->name(), name);
+        });
+    bool is_directory = overlay_info.type == rex::filesystem::FileInfo::Type::kDirectory;
+    if (is_directory) {
+      HostPathEntry* directory;
+      if (existing != parent_entry->children_.end() &&
+          ((*existing)->attributes() & kFileAttributeDirectory)) {
+        directory = static_cast<HostPathEntry*>(existing->get());
+      } else {
+        // A new folder - an empty entry to lay the overlay's files into (its
+        // host path is the overlay's, for any new files listed there).
+        directory = HostPathEntry::Create(this, parent_entry, overlay_child_path, overlay_info);
+        if (!directory) {
+          continue;
+        }
+        if (existing != parent_entry->children_.end()) {
+          existing->reset(directory);
+        } else {
+          parent_entry->children_.push_back(std::unique_ptr<Entry>(directory));
+        }
+      }
+      overlaid += OverlayEntry(directory, overlay_child_path);
+      continue;
+    }
+    HostPathEntry* file = HostPathEntry::Create(this, parent_entry, overlay_child_path, overlay_info);
+    if (!file) {
+      continue;
+    }
+    if (existing != parent_entry->children_.end()) {
+      existing->reset(file);
+    } else {
+      parent_entry->children_.push_back(std::unique_ptr<Entry>(file));
+    }
+    ++overlaid;
+  }
+  return overlaid;
+}
+
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
   for (auto& child_info : child_infos) {

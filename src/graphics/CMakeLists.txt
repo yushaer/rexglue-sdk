@@ -26,6 +26,8 @@ set(REXGPU_XENOS_SOURCES
     pipeline/render_target/cache.cpp
     pipeline/material_shaders.cpp
     pipeline/scene_effects.cpp
+    pipeline/scene_lights.cpp
+    pipeline/texture_replacement.cpp
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/shader/interpreter.cpp
@@ -161,5 +163,10 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+        # Texture dumps (PNG).
+        windowscodecs
     )
 endif()
+
+# stb_image for texture replacements.
+target_include_directories(rexgpu-xenos PRIVATE ${PROJECT_SOURCE_DIR}/thirdparty/stb)

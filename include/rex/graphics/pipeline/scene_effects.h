@@ -293,6 +293,9 @@ class SceneEffects {
   bool ComputeReflections();
   bool ComputeVolumetrics();
   bool FillFogConstants();
+  // The game's local lights captured this frame, nearest first, into the
+  // composite's constants and the heat haze's flames.
+  void FillLightConstants();
   void EstimateSkyColor(RenderTarget& color_rt, const Rect& rect, int32_t screen_offset_x,
                         int32_t screen_offset_y);
   void CaptureSceneColor(RenderTarget& color_rt, const Rect& rect, int32_t screen_offset_x,
@@ -328,9 +331,18 @@ class SceneEffects {
   uint32_t ao_scale_ = 2;
   uint32_t volumetric_scale_ = 2;
   Texture volumetric_result_ = Texture::kVolumetric;
-  // The composite's extra constants for this frame (the fog's, and the
-  // effects' strengths).
-  float composite_constants_[6][4] = {};
+  // The composite's extra constants for this frame (the fog's, the effects'
+  // strengths, and the game's local lights - kCompositeLightRow onward).
+  static constexpr uint32_t kCompositeLightRow = 6;
+  static constexpr uint32_t kMaxCompositeLights = 16;
+  float composite_constants_[kCompositeLightRow + 1 + 2 * kMaxCompositeLights][4] = {};
+  // Of this frame: the game's lights in the composite, embers, and the flames
+  // the heat haze is over (view space position xyz).
+  bool dynamic_lights_active_ = false;
+  bool embers_active_ = false;
+  static constexpr uint32_t kMaxHazeFlames = 4;
+  float haze_flames_[kMaxHazeFlames][3] = {};
+  uint32_t haze_flame_count_ = 0;
 
   Camera camera_ = {};
   bool camera_logged_ = false;

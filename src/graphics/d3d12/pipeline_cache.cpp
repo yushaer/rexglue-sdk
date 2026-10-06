@@ -19,6 +19,7 @@
 #include <deque>
 #include <mutex>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1243,6 +1244,65 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
   }
 
   return translation.is_valid();
+}
+
+void PipelineCache::ReloadMaterialShaders() {
+  bool edram_rov_used =
+      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+  bool enabled = material_shaders::IsEnabled();
+  std::unordered_set<const D3D12Shader::D3D12Translation*> changed_translations;
+  for (const auto& shader_pair : shaders_) {
+    D3D12Shader& shader = *shader_pair.second;
+    if (shader.type() == xenos::ShaderType::kPixel && edram_rov_used) {
+      continue;
+    }
+    for (const auto& translation_pair : shader.translations()) {
+      auto& translation = static_cast<D3D12Shader::D3D12Translation&>(*translation_pair.second);
+      if (!translation.is_translated() || !translation.is_valid()) {
+        continue;
+      }
+      std::vector<uint8_t> material_binary;
+      if (enabled && material_shaders::Load(shader.ucode_data_hash(), translation.modification(),
+                                            "d3d12", "dxbc", material_binary)) {
+        if (translation.translated_binary() == material_binary) {
+          continue;
+        }
+        translation.ReplaceTranslatedBinary(std::move(material_binary));
+      } else {
+        if (!translation.is_binary_replaced()) {
+          continue;
+        }
+        translation.RestoreTranslatedBinary();
+      }
+      changed_translations.insert(&translation);
+    }
+  }
+
+  size_t pipelines_recreated = 0;
+  if (!changed_translations.empty()) {
+    for (const auto& pipeline_pair : pipelines_) {
+      Pipeline& pipeline = *pipeline_pair.second;
+      // Never created yet - will be created with the new code.
+      if (pipeline.pending_vertex_shader || pipeline.pending_pixel_shader) {
+        continue;
+      }
+      if (!changed_translations.count(pipeline.description.vertex_shader) &&
+          !changed_translations.count(pipeline.description.pixel_shader)) {
+        continue;
+      }
+      PipelineRuntimeDescription runtime_description;
+      std::memcpy(&runtime_description, &pipeline.description, sizeof(runtime_description));
+      runtime_description.root_signature = pipeline.root_signature.load(std::memory_order_acquire);
+      ID3D12PipelineState* old_state = pipeline.state.exchange(
+          CreateD3D12Pipeline(runtime_description), std::memory_order_acq_rel);
+      if (old_state) {
+        old_state->Release();
+      }
+      ++pipelines_recreated;
+    }
+  }
+  REXGPU_INFO("Material shaders reloaded: {} translations changed, {} pipelines recreated",
+              changed_translations.size(), pipelines_recreated);
 }
 
 void PipelineCache::DumpBindings(const D3D12Shader::D3D12Translation& translation,

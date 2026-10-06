@@ -71,6 +71,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+  // Releases a resource (taking the reference) once the GPU is done with the
+  // current submission.
+  void ReleaseResourceLater(ID3D12Resource* resource) {
+    resources_for_deletion_.emplace_back(submission_current_, resource);
+  }
+
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
   // done after the latest ExecuteCommandLists + Signal.
@@ -640,6 +646,12 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
+
+  // Material shaders' custom textures (bindless descriptors by slot), and the
+  // texture cache's standalone texture generation they're from.
+  uint32_t custom_texture_descriptors_[8] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                                             UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  uint32_t custom_texture_generation_ = UINT32_MAX;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

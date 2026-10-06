@@ -24,6 +24,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/material_shaders.h>
+#include <rex/graphics/pipeline/texture_replacement.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -3510,6 +3511,21 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
       shared_memory_->ClearCache();
     }
+
+    // New material shaders replace the pipelines' code once the GPU is done
+    // with the old one.
+    if (material_shaders::ConsumeReloadRequest() && AwaitAllQueueOperationsCompletion()) {
+      pipeline_cache_->ReloadMaterialShaders();
+      // The custom textures may have changed too.
+      custom_texture_generation_ = UINT32_MAX;
+    }
+    material_shaders::AdvanceFrame();
+    // Texture packs changed: rescan, and reload every texture (at the next
+    // frame's end, with the GPU idle).
+    if (texture_replacement::ConsumeReloadRequest()) {
+      texture_replacement::Rescan();
+      cache_clear_requested_ = true;
+    }
   }
 
   return true;
@@ -4034,9 +4050,38 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     if (REXCVAR_GET(draw_resolution_scaled_texture_offsets)) {
       translation_flags |= material_shaders::kTranslationFlagScaledTextureOffsets;
     }
+    uint32_t vertex_shader_traits = 0;
+    uint64_t vertex_shader_hash = 0;
+    if (const Shader* vertex_shader = active_vertex_shader()) {
+      vertex_shader_hash = vertex_shader->ucode_data_hash();
+      vertex_shader_traits = material_shaders::GetVertexShaderTraits(*vertex_shader);
+    }
     float material_params[material_shaders::kMaterialParamsCount][4];
     material_shaders::GetParams(material_params, draw_resolution_scale_x, draw_resolution_scale_y,
-                                translation_flags);
+                                translation_flags, vertex_shader_traits, vertex_shader_hash);
+    // The custom textures (loaded again after texture packs or the material
+    // shaders reload), and the bound textures' companion maps.
+    if (custom_texture_generation_ != texture_cache_->standalone_generation()) {
+      custom_texture_generation_ = texture_cache_->standalone_generation();
+      std::fill(std::begin(custom_texture_descriptors_), std::end(custom_texture_descriptors_),
+                material_shaders::kNoTexture);
+      for (const material_shaders::CustomTexture& custom_texture :
+           material_shaders::GetCustomTextures()) {
+        custom_texture_descriptors_[custom_texture.slot] =
+            texture_cache_->GetStandaloneTextureDescriptor(custom_texture.path);
+      }
+    }
+    for (uint32_t slot = 0; slot < material_shaders::kCustomTextureSlotCount; ++slot) {
+      material_params[12 + slot / 4][slot % 4] =
+          std::bit_cast<float>(custom_texture_descriptors_[slot]);
+    }
+    for (uint32_t fetch = 0; fetch < material_shaders::kCompanionFetchCount; ++fetch) {
+      uint32_t companions[4];
+      texture_cache_->GetCompanionDescriptors(fetch, companions);
+      for (uint32_t kind = 0; kind < 4; ++kind) {
+        material_params[14 + fetch][kind] = std::bit_cast<float>(companions[kind]);
+      }
+    }
     static_assert(sizeof(material_params) == sizeof(system_constants_.material_params));
     dirty |= std::memcmp(system_constants_.material_params, material_params,
                          sizeof(material_params)) != 0;

@@ -17,6 +17,10 @@ FX_EXTRA_CONSTANTS_BLOCK(1) {
   float4 fx_image_white;
   // x = shadow lift, y = vignette, z = film grain.
   float4 fx_image_finish;
+  // Heat haze over flames: x = count, y = time (seconds), z = strength.
+  float4 fx_image_haze;
+  // Per flame: xy = its base (render target pixels), z = pixels per world unit.
+  float4 fx_image_flames[FX_MAX_HAZE_FLAMES];
 };
 
 float3 FxLoadImage(int2 pixel) {
@@ -24,9 +28,61 @@ float3 FxLoadImage(int2 pixel) {
   return fx_image.Load(int3(pixel, 0)).rgb;
 }
 
+float3 FxSampleImage(float2 position) {
+  float2 texel = position - 0.5;
+  int2 base = int2(floor(texel));
+  float2 f = texel - float2(base);
+  return lerp(lerp(FxLoadImage(base), FxLoadImage(base + int2(1, 0)), f.x),
+              lerp(FxLoadImage(base + int2(0, 1)), FxLoadImage(base + int2(1, 1)), f.x), f.y);
+}
+
+float FxImageHash(float2 p) {
+  float3 p3 = frac(p.xyx * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return frac((p3.x + p3.y) * p3.z);
+}
+
+float FxImageNoise(float2 p) {
+  float2 cell = floor(p);
+  float2 f = p - cell;
+  float2 u = f * f * (3.0 - 2.0 * f);
+  return lerp(lerp(FxImageHash(cell), FxImageHash(cell + float2(1.0, 0.0)), u.x),
+              lerp(FxImageHash(cell + float2(0.0, 1.0)), FxImageHash(cell + float2(1.0, 1.0)), u.x),
+              u.y);
+}
+
+// The shimmer of hot air rising over flames: the image displaced by rising
+// noise above each one (render target pixels).
+float2 FxHeatHaze(float2 position) {
+  float2 displacement = 0.0;
+  uint count = uint(fx_image_haze.x);
+  float time = fx_image_haze.y;
+  [loop] for (uint i = 0; i < count; ++i) {
+    float4 flame = fx_image_flames[i];
+    // Around the flame in world units: x across, y up.
+    float2 offset = (position - flame.xy) / flame.z * float2(1.0, -1.0);
+    if (offset.y < 0.0 || offset.y > 2.2 || abs(offset.x) > 0.6) {
+      continue;
+    }
+    float weight = smoothstep(0.0, 0.35, offset.y) * (1.0 - smoothstep(1.1, 2.2, offset.y)) *
+                   (1.0 - smoothstep(0.3, 0.6, abs(offset.x)));
+    float2 rising = float2(offset.x * 6.0 + float(i) * 13.1, offset.y * 4.0 - time * 3.2);
+    float2 wave = float2(FxImageNoise(rising), FxImageNoise(rising + float2(17.3, 5.9))) - 0.5;
+    // Up to a few pixels - more for nearer flames.
+    displacement += wave * (weight * min(flame.z * 0.03, 4.0));
+  }
+  return displacement * fx_image_haze.z;
+}
+
 float4 main(float4 position : SV_Position) : SV_Target {
   int2 pixel = int2(position.xy);
   float3 color = FxLoadImage(pixel);
+  if (fx_image_haze.x > 0.0) {
+    float2 haze = FxHeatHaze(position.xy);
+    if (any(abs(haze) > 0.01)) {
+      color = FxSampleImage(position.xy + haze);
+    }
+  }
   if (fx_image_sharpen.y > 0.0) {
     //   a b c
     //   d e f

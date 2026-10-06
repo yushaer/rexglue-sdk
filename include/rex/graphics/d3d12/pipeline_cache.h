@@ -67,6 +67,12 @@ class PipelineCache {
   void EndSubmission();
   bool IsCreatingPipelines();
 
+  // Reads the material shaders (rex/graphics/pipeline/material_shaders.h) for
+  // every translation again, and recreates the pipelines of the translations
+  // that changed. The GPU must not be using any pipeline, and no submission
+  // may be open.
+  void ReloadMaterialShaders();
+
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count);
   // Analyze shader microcode on the translator thread.

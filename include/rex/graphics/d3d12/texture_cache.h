@@ -12,7 +12,11 @@
 #pragma once
 
 #include <array>
+#include <cstring>
+#include <deque>
+#include <filesystem>
 #include <functional>
+#include <string>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -23,6 +27,7 @@
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/pipeline/texture_replacement.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
@@ -87,6 +92,16 @@ class D3D12TextureCache final : public TextureCache {
   void ClearCache() override;
 
   void BeginSubmission(uint64_t new_submission_index) override;
+
+  // Texture packs' companion maps of the texture in a fetch constant: bindless
+  // descriptor indices (or UINT32_MAX) in material_shaders::CompanionMap order.
+  void GetCompanionDescriptors(uint32_t fetch_constant, uint32_t descriptors_out[4]);
+  // A texture from an image file (custom textures for shaders, companion
+  // maps), loaded once: its bindless descriptor index, or UINT32_MAX.
+  uint32_t GetStandaloneTextureDescriptor(const std::filesystem::path& path);
+  // Changes when the standalone textures are released (their descriptors
+  // become invalid).
+  uint32_t standalone_generation() const { return standalone_generation_; }
   void BeginFrame() override;
   void EndFrame();
 
@@ -176,9 +191,42 @@ class D3D12TextureCache final : public TextureCache {
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
 
+  bool ApplyTextureReplacement(Texture& texture, uint64_t content_hash) override;
+  void DumpTexture(Texture& texture, uint64_t content_hash) override;
+
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
  private:
+  // A texture's top level being copied back for dump_textures.
+  struct PendingDump {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    uint32_t row_count;
+    DXGI_FORMAT format;
+    // Guest XYZW from the host's components (the host format swizzle).
+    uint32_t host_format_swizzle;
+    uint64_t content_hash;
+    uint64_t submission;
+  };
+  // Writes the dumps whose copies the GPU has finished.
+  void WriteCompletedDumps(uint64_t completed_submission);
+  std::deque<PendingDump> pending_dumps_;
+
+  // A texture created from an image, uploaded in the current submission (the
+  // resource is left in COPY_DEST).
+  bool CreateTextureFromImage(const texture_replacement::Image& image,
+                              const std::filesystem::path& path,
+                              Microsoft::WRL::ComPtr<ID3D12Resource>& resource,
+                              DXGI_FORMAT& format);
+  struct StandaloneTexture {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint32_t descriptor_index = UINT32_MAX;
+  };
+  // With the GPU idle.
+  void ReleaseStandaloneTextures();
+  std::unordered_map<std::string, StandaloneTexture> standalone_textures_;
+  uint32_t standalone_generation_ = 0;
+
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 
@@ -231,6 +279,10 @@ class D3D12TextureCache final : public TextureCache {
         uint32_t is_signed : 1;
         uint32_t host_swizzle : 12;
         uint32_t dimension : 2;
+        // Of the replacement texture rather than the guest data - which one
+        // (descriptors of earlier ones may still be in use by the GPU).
+        uint32_t replaced : 1;
+        uint32_t replacement_generation : 16;
       };
 
       SRVDescriptorKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -251,12 +303,49 @@ class D3D12TextureCache final : public TextureCache {
                           bool track_usage = true);
     ~D3D12Texture();
 
-    ID3D12Resource* resource() const { return resource_.Get(); }
+    // The replacement's resource while one is shown, otherwise the guest data's.
+    ID3D12Resource* resource() const {
+      return replacement_resource_ ? replacement_resource_.Get() : resource_.Get();
+    }
 
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
-      D3D12_RESOURCE_STATES old_state = resource_state_;
-      resource_state_ = new_state;
+      D3D12_RESOURCE_STATES& state =
+          replacement_resource_ ? replacement_resource_state_ : resource_state_;
+      D3D12_RESOURCE_STATES old_state = state;
+      state = new_state;
       return old_state;
+    }
+
+    // Texture packs: a replacement shown instead of the guest data.
+    bool has_replacement() const { return replacement_resource_ != nullptr; }
+    uint64_t replacement_hash() const { return replacement_hash_; }
+    DXGI_FORMAT replacement_format() const { return replacement_format_; }
+    uint32_t replacement_mip_levels() const { return replacement_mip_levels_; }
+    void SetReplacement(ID3D12Resource* resource, D3D12_RESOURCE_STATES state, DXGI_FORMAT format,
+                        uint32_t mip_levels, uint64_t hash) {
+      replacement_resource_ = resource;
+      replacement_resource_state_ = state;
+      replacement_format_ = format;
+      replacement_mip_levels_ = mip_levels;
+      replacement_hash_ = hash;
+      ++replacement_generation_;
+    }
+    uint32_t replacement_generation() const { return replacement_generation_ & 0xFFFF; }
+
+    // Texture packs' companion maps found for content_hash (bindless
+    // descriptors, or UINT32_MAX).
+    uint64_t companion_hash() const { return companion_hash_; }
+    void SetCompanions(uint64_t hash, const uint32_t descriptors[4]) {
+      companion_hash_ = hash;
+      std::memcpy(companion_descriptors_, descriptors, sizeof(companion_descriptors_));
+    }
+    void GetCompanions(uint32_t descriptors_out[4]) const {
+      std::memcpy(descriptors_out, companion_descriptors_, sizeof(companion_descriptors_));
+    }
+    // The replacement resource, for release once the GPU is done with it.
+    ID3D12Resource* DetachReplacement() {
+      replacement_hash_ = 0;
+      return replacement_resource_.Detach();
     }
 
     uint32_t GetSRVDescriptorIndex(SRVDescriptorKey descriptor_key) const {
@@ -272,6 +361,15 @@ class D3D12TextureCache final : public TextureCache {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> replacement_resource_;
+    D3D12_RESOURCE_STATES replacement_resource_state_ = D3D12_RESOURCE_STATE_COMMON;
+    DXGI_FORMAT replacement_format_ = DXGI_FORMAT_UNKNOWN;
+    uint32_t replacement_mip_levels_ = 0;
+    uint64_t replacement_hash_ = 0;
+    uint32_t replacement_generation_ = 0;
+    uint64_t companion_hash_ = 0;
+    uint32_t companion_descriptors_[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 
     // For bindful - indices in the non-shader-visible descriptor cache for
     // copying to the shader-visible heap (much faster than recreating, which,
@@ -400,8 +498,10 @@ class D3D12TextureCache final : public TextureCache {
   // Returns the index of an existing of a newly created non-shader-visible
   // cached (for bindful) or a shader-visible global (for bindless) descriptor,
   // or UINT32_MAX if failed to create.
+  // guest_swizzle: the fetch constant's alone, for replacement textures.
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
-                                         bool is_signed, uint32_t host_swizzle);
+                                         bool is_signed, uint32_t host_swizzle,
+                                         uint32_t guest_swizzle);
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 

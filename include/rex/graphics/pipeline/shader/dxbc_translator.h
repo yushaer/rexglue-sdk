@@ -267,6 +267,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // - SystemConstants::Index enum.
   // - system_constant_rdef_.
   // - d3d12/shaders/xenos_draw.hlsli (for geometry shaders).
+  // material_shaders::kMaterialParamsCount.
+  static constexpr uint32_t kMaterialParamsVectorCount = 22;
   struct SystemConstants {
     uint32_t flags;
     union {
@@ -391,7 +393,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // Not used by the translated shaders - for the material shaders that
     // replace them (rex/graphics/pipeline/material_shaders.h): the material
     // settings, and the translation parameters baked into translated shaders.
-    float material_params[4][4];
+    float material_params[kMaterialParamsVectorCount][4];
 
    private:
     friend class DxbcShaderTranslator;
@@ -972,6 +974,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kUint4Array48,
     // Descriptor indices - size written dynamically.
     kUint4DescriptorIndexArray,
+    // Material shader parameters.
+    kFloat4MaterialParamsArray,
 
     kCount,
     kUnknown = kCount

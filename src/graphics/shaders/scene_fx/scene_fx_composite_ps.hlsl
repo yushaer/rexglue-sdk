@@ -40,6 +40,12 @@ FX_EXTRA_CONSTANTS_BLOCK(9) {
   float4 fx_fog_sun_color;
   // x = contact shadow strength, y = reflection intensity.
   float4 fx_effect_strengths;
+  // The game's local lights (scene_lights.h): x = count, y = time (seconds),
+  // z = dynamic lighting strength (0 = off), w = embers' strength (0 = off).
+  float4 fx_lights_info;
+  // Per light, two: xyz = view space position, w = radius; rgb = color
+  // (flickering for flames), w = 1 for a flame.
+  float4 fx_lights[FX_MAX_LIGHTS * 2];
 };
 
 // An effect at fx_effect_scale at this pixel: the pixel itself at full
@@ -74,6 +80,143 @@ float FxFogOpticalDepth(float3 direction, float distance) {
                        ? (1.0 - exp(min(-k * distance, 80.0))) / k
                        : distance;
   return fx_fog_density.w * distance + at_camera * integral;
+}
+
+float FxLoadDistance(int2 pixel) {
+  return fx_depth.Load(int3(clamp(pixel, int2(0, 0), int2(fx_scene_size) - 1), 0));
+}
+
+float2 FxScreenFromView(float3 view) {
+  float2 ndc = float2(view.x / (view.z * fx_inv_p00), view.y / (view.z * fx_inv_p11));
+  return (ndc * float2(0.5, -0.5) + 0.5) * float2(fx_scene_size);
+}
+
+// The surface's view space normal from the depth of its neighbors - across the
+// nearer neighbor on each axis, so edges don't bend it.
+float3 FxSurfaceNormal(int2 pixel, float3 center) {
+  float3 left = FxViewPosition(float2(pixel + int2(-1, 0)) + 0.5, FxLoadDistance(pixel + int2(-1, 0)));
+  float3 right = FxViewPosition(float2(pixel + int2(1, 0)) + 0.5, FxLoadDistance(pixel + int2(1, 0)));
+  float3 up = FxViewPosition(float2(pixel + int2(0, -1)) + 0.5, FxLoadDistance(pixel + int2(0, -1)));
+  float3 down = FxViewPosition(float2(pixel + int2(0, 1)) + 0.5, FxLoadDistance(pixel + int2(0, 1)));
+  float3 dx = abs(right.z - center.z) < abs(center.z - left.z) ? right - center : center - left;
+  float3 dy = abs(down.z - center.z) < abs(center.z - up.z) ? down - center : center - up;
+  float3 normal = cross(dx, dy);
+  float length_squared = dot(normal, normal);
+  return length_squared > 1.0e-12 ? normal * rsqrt(length_squared) : float3(0.0, 0.0, -1.0);
+}
+
+// Whether the way to a light is clear, marching through the depth buffer for
+// up to 1.5 units (nearby occluders: the light leaking through walls and
+// props, rather than shadows across the scene).
+float FxLightVisibility(float3 surface, float3 to_light, float distance, float jitter) {
+  float march = min(distance * 0.9, 1.5);
+  float3 step = to_light / distance * (march / 8.0);
+  [loop] for (uint i = 0; i < 8u; ++i) {
+    float3 point_view = surface + step * (float(i) + jitter);
+    if (point_view.z <= 0.05) {
+      break;
+    }
+    float2 point_screen = FxScreenFromView(point_view);
+    if (any(point_screen < 0.0) || any(point_screen >= float2(fx_scene_size))) {
+      break;
+    }
+    float in_front = point_view.z - FxLoadDistance(int2(point_screen));
+    if (in_front > 0.03 + 0.01 * point_view.z && in_front < 0.75) {
+      return 0.0;
+    }
+  }
+  return 1.0;
+}
+
+// The game's local lights at the surface (irradiance, without the surface's
+// color).
+float3 FxDynamicLights(int2 pixel, float2 screen, float distance) {
+  float3 surface = FxViewPosition(screen, distance);
+  float3 normal = FxSurfaceNormal(pixel, surface);
+  float jitter = FxNoise(float2(pixel) + float(fx_frame % 64u) * 5.588238);
+  float3 total = 0.0;
+  uint count = uint(fx_lights_info.x);
+  [loop] for (uint i = 0; i < count; ++i) {
+    float4 light = fx_lights[i * 2u];
+    float3 to_light = light.xyz - surface;
+    float light_distance = length(to_light);
+    if (light_distance >= light.w || light_distance < 1.0e-4) {
+      continue;
+    }
+    // The game's own falloff, and a little wrap for normals from depth.
+    float falloff = 1.0 - light_distance / light.w;
+    float facing = saturate(dot(normal, to_light / light_distance) * 0.85 + 0.15);
+    if (falloff * facing <= 0.0) {
+      continue;
+    }
+    total += fx_lights[i * 2u + 1u].rgb *
+             (falloff * facing * FxLightVisibility(surface, to_light, light_distance, jitter));
+  }
+  return total;
+}
+
+float FxHash(float2 p) {
+  float3 p3 = frac(p.xyx * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return frac((p3.x + p3.y) * p3.z);
+}
+
+// Embers drifting up from the flames: glowing specks rising, swaying and
+// fading, in front of what's behind the fire.
+float3 FxEmbers(float2 screen, float distance) {
+  float3 total = 0.0;
+  uint count = uint(fx_lights_info.x);
+  float time = fx_lights_info.y;
+  [loop] for (uint i = 0; i < count; ++i) {
+    float4 light = fx_lights[i * 2u];
+    float4 color = fx_lights[i * 2u + 1u];
+    if (color.w < 0.5 || light.z < 0.3) {
+      continue;
+    }
+    float2 center = FxScreenFromView(light.xyz);
+    float pixels_per_unit = 0.5 * float(fx_scene_size.y) / (light.z * fx_inv_p11);
+    // Around the fire in world units: x across, y up.
+    float2 offset = (screen - center) / pixels_per_unit * float2(1.0, -1.0);
+    if (offset.y < -0.2 || offset.y > 2.4 || abs(offset.x) > 0.9 ||
+        distance < light.z - 0.5) {
+      continue;
+    }
+    // As bright as the flames on screen (the scene's own exposure): the
+    // brightest of a few points up the fire, at the half resolution capture.
+    float flame_brightness = 0.0;
+    int2 half_size = int2((fx_scene_size + 1) >> 1);
+    [unroll] for (int sample_index = 0; sample_index < 3; ++sample_index) {
+      float2 sample_screen = center - float2(0.0, (float(sample_index) * 0.15 - 0.05) * pixels_per_unit);
+      int2 sample_texel = clamp(int2(sample_screen * 0.5), int2(0, 0), half_size - 1);
+      flame_brightness =
+          max(flame_brightness, FxLuminance(fx_scene_color.Load(int3(sample_texel, 0)).rgb));
+    }
+    float brightness = max(flame_brightness, 0.5 * FxLuminance(fx_sky.Load(int3(0, 0, 0)).rgb));
+    float seed = float(i) * 17.31;
+    float ember_radius = max(0.02 * pixels_per_unit, 1.3);
+    float3 light_total = 0.0;
+    [unroll] for (uint layer = 0; layer < 2u; ++layer) {
+      // Cells of 0.18 x 0.3 units rising at different speeds.
+      float speed = layer == 0u ? 0.9 : 1.4;
+      float2 cell_space = float2(offset.x / 0.18, (offset.y - time * speed) / 0.3) +
+                          float2(seed + float(layer) * 3.7, 0.0);
+      float2 cell = floor(cell_space);
+      float presence = FxHash(cell + float2(seed, layer * 11.0));
+      if (presence < 0.74) {
+        continue;
+      }
+      float2 in_cell = float2(FxHash(cell + 1.7), FxHash(cell + 4.1)) * 0.6 + 0.2;
+      in_cell.x += sin(time * 2.3 + presence * 40.0) * 0.15;
+      float2 delta_pixels = (cell_space - cell - in_cell) * float2(0.18, 0.3) * pixels_per_unit;
+      float speck = saturate(1.0 - length(delta_pixels) / ember_radius);
+      float height_fade = saturate(1.0 - offset.y / 2.4) * saturate((offset.y + 0.2) * 4.0) *
+                          saturate(1.0 - abs(offset.x) / 0.9);
+      float twinkle = 0.55 + 0.45 * sin(time * 13.0 + presence * 57.0);
+      light_total += float3(1.0, 0.42, 0.1) * (speck * height_fade * twinkle);
+    }
+    total += light_total * (1.5 * brightness);
+  }
+  return total * fx_lights_info.w;
 }
 
 float4 main(float4 position : SV_Position) : SV_Target {
@@ -156,7 +299,11 @@ float4 main(float4 position : SV_Position) : SV_Target {
     reflections = reflection.rgb * (fx_effect_strengths.y * fog_transmittance);
   }
   if (fx_composite_mode == FX_COMPOSITE_ADD) {
-    return float4(fog_light + shafts + reflections, 0.0);
+    float3 embers = 0.0;
+    if (fx_lights_info.w > 0.0 && fx_lights_info.x > 0.0) {
+      embers = FxEmbers(screen, depth);
+    }
+    return float4(fog_light + shafts + reflections + embers, 0.0);
   }
 
   float contact = 1.0;
@@ -179,6 +326,23 @@ float4 main(float4 position : SV_Position) : SV_Target {
   // surface reflects albedo * light, approximated as its color * light /
   // (its brightness, but not below a fraction of the sky's).
   float3 indirect = 0.0;
+  // The game's local lights, likewise relative to the surface's brightness.
+  float3 dynamic_light = 0.0;
+  if (fx_lights_info.z > 0.0 && fx_lights_info.x > 0.0 && !is_sky) {
+    float3 irradiance = FxDynamicLights(pixel, screen, depth);
+    if (any(irradiance > 0.0)) {
+      float3 surface = 0.0;
+      [unroll] for (int i = 0; i < 4; ++i) {
+        surface += fx_scene_color.Load(int3(texels[i], 0)).rgb * weights[i];
+      }
+      surface *= inv_weight_sum;
+      float floor_brightness =
+          max(0.1 * FxLuminance(fx_sky.Load(int3(0, 0, 0)).rgb), 0.02);
+      dynamic_light =
+          min(fx_lights_info.z * 1.2 * irradiance / max(FxLuminance(surface), floor_brightness),
+              8.0);
+    }
+  }
   if ((fx_effect_flags & FX_EFFECT_GI) && !is_sky) {
     float3 light = 0.0;
     float3 surface = 0.0;
@@ -215,5 +379,5 @@ float4 main(float4 position : SV_Position) : SV_Target {
   if (fx_debug_mode == FX_DEBUG_REFLECTIONS) {
     return float4(reflections / (1.0 + reflections), 1.0);
   }
-  return float4((ao * contact + indirect) * fog_transmittance, 1.0);
+  return float4((ao * contact + indirect + dynamic_light) * fog_transmittance, 1.0);
 }

@@ -40,6 +40,11 @@
 #define FX_DEBUG_CONTACT_SHADOWS 6u
 #define FX_DEBUG_REFLECTIONS 7u
 
+// The game's local lights the composite takes (scene_lights.h), and the flames
+// the heat haze is drawn over.
+#define FX_MAX_LIGHTS 16
+#define FX_MAX_HAZE_FLAMES 4
+
 // fx_composite_mode.
 #define FX_COMPOSITE_MULTIPLY 0u  // dest * (occlusion + indirect) * fog transmittance
 #define FX_COMPOSITE_ADD 1u       // dest + scattered light (fog, light shafts)

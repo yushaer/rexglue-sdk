@@ -20,6 +20,9 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture_replacement.h>
+#include <rex/graphics/shared_memory.h>
+#include <rex/system/xmemory.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -349,6 +352,12 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
 }
 
+bool TextureCache::IsTextureReplaceable(const TextureKey& key) {
+  return key.dimension == xenos::DataDimension::k2DOrStacked &&
+         key.depth_or_array_size_minus_1 == 0 && !key.scaled_resolve && !key.signed_separate &&
+         key.GetWidth() >= 4 && key.GetHeight() >= 4;
+}
+
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
   uint32_t host_swizzle = 0;
   for (uint32_t i = 0; i < 4; ++i) {
@@ -435,9 +444,39 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
+  // Texture packs: the replacement for the guest data's hash instead, if any.
+  bool replaced = false;
+  bool dump = false;
+  uint64_t content_hash = 0;
+  bool replacement = texture_replacement::IsEnabled();
+  if ((replacement || texture_replacement::IsDumping()) && IsTextureReplaceable(texture_key)) {
+    if (pending_load.load_base) {
+      const uint8_t* guest_data = shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(
+          texture_key.base_page << 12);
+      uint32_t guest_size = texture.GetGuestBaseSize();
+      content_hash = guest_data && guest_size
+                         ? texture_replacement::HashGuestTexture(
+                               guest_data, guest_size, uint32_t(texture_key.format),
+                               texture_key.GetWidth(), texture_key.GetHeight(), texture_key.pitch,
+                               texture_key.tiled != 0, uint32_t(texture_key.endianness))
+                         : 0;
+      texture.set_content_hash(content_hash);
+    } else {
+      // Only the mips changed - the base's hash still identifies it.
+      content_hash = texture.content_hash();
+    }
+    if (content_hash) {
+      replaced = ApplyTextureReplacement(texture, replacement ? content_hash : 0);
+      dump = !replaced && pending_load.load_base && texture_replacement::ShouldDump(content_hash);
+    }
+  }
+
+  if (!replaced && !LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+                                                          pending_load.load_mips)) {
     return false;
+  }
+  if (dump) {
+    DumpTexture(texture, content_hash);
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
@@ -504,6 +543,7 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    binding.guest_swizzle = fetch.swizzle;
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for

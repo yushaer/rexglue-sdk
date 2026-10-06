@@ -9,15 +9,21 @@
 #include <rex/ui/overlay/effects_overlay.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include <imgui.h>
+#include <toml++/toml.hpp>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
+#include <rex/system/mods.h>
 
 namespace rex::ui {
 
@@ -161,7 +167,218 @@ const int kAnisotropyValues[] = {-1, 0, 2, 3, 4, 5};
 const char* const kAntiAliasingValues[] = {"none", "fxaa", "fxaa_extreme"};
 const char* const kAntiAliasingLabels[] = {"Off", "FXAA", "FXAA (extreme)"};
 
+// The shader options the material folders declare (options.toml - see
+// rex/graphics/pipeline/material_shaders.h), mods' first.
+struct ShaderOption {
+  std::string id;
+  std::string label;
+  std::string group;
+  std::string description;
+  bool checkbox = false;
+  float default_value = 0.0f;
+  float min = 0.0f;
+  float max = 1.0f;
+};
+
+std::filesystem::path Utf8Path(std::string_view text) {
+  return std::filesystem::u8path(text.begin(), text.end());
+}
+
+std::vector<ShaderOption> LoadShaderOptions() {
+  std::vector<std::filesystem::path> folders;
+  std::string mod_folders = rex::cvar::GetFlagByName("mods_folders");
+  size_t start = 0;
+  while (start < mod_folders.size()) {
+    size_t end = mod_folders.find('|', start);
+    if (end == std::string::npos) {
+      end = mod_folders.size();
+    }
+    if (end > start) {
+      folders.push_back(Utf8Path(std::string_view(mod_folders).substr(start, end - start)) /
+                        "materials");
+    }
+    start = end + 1;
+  }
+  std::filesystem::path base = Utf8Path(rex::cvar::GetFlagByName("material_shaders_path"));
+  if (base.is_relative()) {
+    base = rex::filesystem::GetExecutableFolder() / base;
+  }
+  folders.push_back(base);
+  std::vector<ShaderOption> options;
+  std::error_code error;
+  for (const std::filesystem::path& folder : folders) {
+    std::filesystem::path path = folder / "options.toml";
+    if (!std::filesystem::is_regular_file(path, error)) {
+      continue;
+    }
+    try {
+      toml::table config = toml::parse_file(path.u8string());
+      const toml::array* entries = config["option"].as_array();
+      if (!entries) {
+        continue;
+      }
+      for (const toml::node& node : *entries) {
+        const toml::table* entry = node.as_table();
+        if (!entry) {
+          continue;
+        }
+        ShaderOption option;
+        option.id = (*entry)["id"].value_or(std::string());
+        if (option.id.empty() ||
+            std::any_of(options.begin(), options.end(),
+                        [&](const ShaderOption& other) { return other.id == option.id; })) {
+          continue;
+        }
+        option.label = (*entry)["label"].value_or(option.id);
+        option.group = (*entry)["group"].value_or(std::string("Other"));
+        option.description = (*entry)["description"].value_or(std::string());
+        option.checkbox = (*entry)["type"].value_or(std::string("slider")) == "checkbox";
+        option.default_value = float((*entry)["default"].value_or(0.0));
+        option.min = float((*entry)["min"].value_or(0.0));
+        option.max = float((*entry)["max"].value_or(1.0));
+        options.push_back(std::move(option));
+      }
+    } catch (const toml::parse_error&) {
+    }
+  }
+  std::stable_sort(options.begin(), options.end(),
+                   [](const ShaderOption& a, const ShaderOption& b) { return a.group < b.group; });
+  return options;
+}
+
 }  // namespace
+
+void EffectsDialog::DrawShaderOptions() {
+  static std::vector<ShaderOption> options;
+  static bool loaded = false;
+  if (!loaded || ImGui::Button("Reload options")) {
+    options = LoadShaderOptions();
+    loaded = true;
+  }
+  Description(
+      "Settings the material shaders and mods declare (options.toml in their folders).");
+  if (options.empty()) {
+    ImGui::TextUnformatted("No shader options installed.");
+    return;
+  }
+  // The values set: id=value pairs in material_options.
+  std::string overrides = rex::cvar::GetFlagByName("material_options");
+  auto value_of = [&](const ShaderOption& option) {
+    std::string key = option.id + "=";
+    size_t position = 0;
+    while ((position = overrides.find(key, position)) != std::string::npos) {
+      if (position == 0 || overrides[position - 1] == ',') {
+        return std::strtof(overrides.c_str() + position + key.size(), nullptr);
+      }
+      position += key.size();
+    }
+    return option.default_value;
+  };
+  bool changed = false;
+  std::vector<float> values;
+  for (const ShaderOption& option : options) {
+    values.push_back(value_of(option));
+  }
+  std::string group;
+  bool group_open = false;
+  for (size_t i = 0; i < options.size(); ++i) {
+    const ShaderOption& option = options[i];
+    if (option.group != group || i == 0) {
+      if (group_open) {
+        ImGui::TreePop();
+      }
+      group = option.group;
+      group_open = ImGui::TreeNodeEx(group.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+    }
+    if (!group_open) {
+      continue;
+    }
+    ImGui::PushID(option.id.c_str());
+    if (option.checkbox) {
+      bool checked = values[i] > 0.5f;
+      if (ImGui::Checkbox(option.label.c_str(), &checked)) {
+        values[i] = checked ? 1.0f : 0.0f;
+        changed = true;
+      }
+    } else if (ImGui::SliderFloat(option.label.c_str(), &values[i], option.min, option.max)) {
+      changed = true;
+    }
+    if (!option.description.empty() && ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("%s", option.description.c_str());
+    }
+    ImGui::PopID();
+  }
+  if (group_open) {
+    ImGui::TreePop();
+  }
+  if (ImGui::Button("Defaults##shader_options")) {
+    for (size_t i = 0; i < options.size(); ++i) {
+      values[i] = options[i].default_value;
+    }
+    changed = true;
+  }
+  if (changed) {
+    std::string text;
+    for (size_t i = 0; i < options.size(); ++i) {
+      if (std::abs(values[i] - options[i].default_value) < 1.0e-6f) {
+        continue;
+      }
+      char value[32];
+      std::snprintf(value, sizeof(value), "%.4g", values[i]);
+      if (!text.empty()) {
+        text += ',';
+      }
+      text += options[i].id + "=" + value;
+    }
+    rex::cvar::SetFlagByName("material_options", text);
+  }
+}
+
+void EffectsDialog::DrawMods() {
+  Description(
+      "Mods in the mods folder: game files, texture packs (with normal, roughness and height "
+      "maps), and shaders. Turning one on or off fully applies at the next start.");
+  const std::vector<rex::mods::ModInfo>& mods = rex::mods::GetMods();
+  if (mods.empty()) {
+    ImGui::TextUnformatted("No mods installed.");
+  }
+  for (const rex::mods::ModInfo& mod : mods) {
+    ImGui::PushID(mod.id.c_str());
+    bool enabled = mod.enabled;
+    std::string label = mod.name + (mod.version.empty() ? "" : " " + mod.version);
+    if (ImGui::Checkbox(label.c_str(), &enabled)) {
+      rex::mods::SetEnabled(mod.id, enabled);
+      status_ = "Mods change at the next start (or Reload for textures and shaders)";
+    }
+    std::string details;
+    if (!mod.author.empty()) {
+      details += "by " + mod.author + " - ";
+    }
+    details += std::to_string(mod.texture_count) + " textures, " +
+               std::to_string(mod.material_count) + " shaders, " +
+               std::to_string(mod.file_count) + " game files, priority " +
+               std::to_string(mod.priority);
+    Description(details.c_str());
+    if (!mod.description.empty()) {
+      Description(mod.description.c_str());
+    }
+    ImGui::PopID();
+  }
+  if (HasCvar("mods_reload") && ImGui::Button("Reload mods")) {
+    rex::cvar::InvokeCommand("mods_reload", "");
+    status_ = "Mods reloaded (textures and shaders)";
+  }
+  if (HasCvar("texture_replacement")) {
+    CheckboxCvar("Texture packs", "texture_replacement");
+    bool dumping = !rex::cvar::GetFlagByName("dump_textures").empty();
+    if (ImGui::Checkbox("Dump textures for modding", &dumping)) {
+      rex::cvar::SetFlagByName("dump_textures", dumping ? "texture_dump" : "");
+    }
+    Description(
+        "Writes each texture the game loads to texture_dump next to the executable, named by "
+        "its hash - a mod replaces one with <hash>.png or .dds in its textures folder.");
+  }
+}
 
 EffectsDialog::EffectsDialog(ImGuiDrawer* imgui_drawer, std::filesystem::path config_path)
     : ImGuiDialog(imgui_drawer), config_path_(std::move(config_path)) {}
@@ -318,6 +535,24 @@ void EffectsDialog::OnDraw(ImGuiIO& /*io*/) {
     ImGui::PopID();
   }
 
+  if (HasCvar("scene_fx_dynamic_lights") &&
+      EffectHeader("Dynamic Lights", "scene_fx_dynamic_lights")) {
+    ImGui::PushID("dynamic_lights");
+    Description(
+        "The game's fires, lamps and other lights light everything around them - walls and "
+        "ground too, not only characters and props - with short shadows, flickering with "
+        "their flames.");
+    SliderCvar("Strength", "scene_fx_dynamic_lights_intensity", 0.0f, 4.0f);
+    ImGui::PopID();
+  }
+
+  if (HasCvar("scene_fx_fire") && EffectHeader("Fire", "scene_fx_fire")) {
+    ImGui::PushID("fire");
+    Description("Heat haze shimmering over flames, and glowing embers drifting up from them.");
+    SliderCvar("Strength", "scene_fx_fire_intensity", 0.0f, 3.0f);
+    ImGui::PopID();
+  }
+
   if (EffectHeader("Sharpening", "scene_fx_sharpen")) {
     ImGui::PushID("sharpen");
     Description(
@@ -348,7 +583,14 @@ void EffectsDialog::OnDraw(ImGuiIO& /*io*/) {
     Description(
         "Rewritten versions of the game's own shaders with modern lighting, replacing its "
         "rendering rather than adding to the finished image (Direct3D 12).");
-    CheckboxCvar("Material shaders (applies after restarting)", "material_shaders");
+    CheckboxCvar("Material shaders", "material_shaders");
+    if (HasCvar("material_shaders_reload")) {
+      ImGui::SameLine();
+      if (ImGui::Button("Reload from disk")) {
+        rex::cvar::InvokeCommand("material_shaders_reload", "");
+        status_ = "Material shaders reloaded";
+      }
+    }
     CheckboxCvar("Soft sun shadows", "material_soft_shadows");
     Description(
         "Percentage-closer soft shadows: sharp where objects touch the ground, softer the "
@@ -360,6 +602,33 @@ void EffectsDialog::OnDraw(ImGuiIO& /*io*/) {
         "strongest at grazing angles.");
     SliderCvar("Highlight strength", "material_specular_intensity", 0.0f, 4.0f);
     SliderCvar("Roughness", "material_roughness", 0.05f, 1.0f);
+    if (HasCvar("material_character_lighting")) {
+      CheckboxCvar("Character lighting", "material_character_lighting");
+      Description(
+          "Softer light falloff across characters and props, and a sheen from the sky at "
+          "grazing angles. Shadows from nearby lights are smoothed too.");
+      SliderCvar("Sheen", "material_sheen_intensity", 0.0f, 2.0f);
+      CheckboxCvar("Foliage", "material_foliage");
+      Description(
+          "Light shining through grass and leaves, softer lighting, and blades that don't "
+          "thin out in the distance.");
+      SliderCvar("Translucency", "material_foliage_translucency", 0.0f, 2.0f);
+      CheckboxCvar("Fire", "material_fire");
+      Description("Turbulent, animated flames with brighter cores that glow.");
+      SliderCvar("Flame brightness", "material_fire_intensity", 0.0f, 3.0f);
+    }
+    ImGui::PopID();
+  }
+
+  if (HasCvar("material_options") && ImGui::CollapsingHeader("Shader Options")) {
+    ImGui::PushID("shader_options");
+    DrawShaderOptions();
+    ImGui::PopID();
+  }
+
+  if (HasCvar("mods") && ImGui::CollapsingHeader("Mods")) {
+    ImGui::PushID("mods");
+    DrawMods();
     ImGui::PopID();
   }
 

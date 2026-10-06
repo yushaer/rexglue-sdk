@@ -15,6 +15,8 @@
 #include <cstring>
 
 #include <rex/cvar.h>
+#include <rex/graphics/pipeline/material_shaders.h>
+#include <rex/graphics/pipeline/scene_lights.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -178,6 +180,22 @@ REXCVAR_DEFINE_DOUBLE(scene_fx_vignette, 0.0, "GPU/Effects",
 REXCVAR_DEFINE_DOUBLE(scene_fx_film_grain, 0.0, "GPU/Effects", "Film grain")
     .range(0.0, 1.0) REX_SCENE_FX_LIVE;
 
+// The game's local lights (scene_lights.h).
+REXCVAR_DEFINE_BOOL(scene_fx_dynamic_lights, true, "GPU/Effects",
+                    "Dynamic lights: the game's fires and lamps light every surface around them "
+                    "- walls and ground too, not just characters and props - flickering with "
+                    "their flames")
+    REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_dynamic_lights_intensity, 1.0, "GPU/Effects",
+                      "Strength of the dynamic lights")
+    .range(0.0, 4.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_BOOL(scene_fx_fire, true, "GPU/Effects",
+                    "Fire effects: heat haze rising over flames, and embers drifting up from them")
+    REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_fire_intensity, 1.0, "GPU/Effects",
+                      "Strength of the heat haze and embers")
+    .range(0.0, 3.0) REX_SCENE_FX_LIVE;
+
 // Common.
 REXCVAR_DEFINE_INT32(scene_fx_camera_constant, 0, "GPU/Effects",
                      "First of the four vertex shader float constants holding the (world-) "
@@ -256,12 +274,50 @@ struct ReflectionConstants {
   float params[4];
 };
 
+// As in scene_fx_common.hlsli.
+constexpr uint32_t kMaxCompositeLights = 16;
+constexpr uint32_t kMaxHazeFlames = 4;
+
 struct ImageConstants {
   float sharpen[4];
   float grade[4];
   float white[4];
   float finish[4];
+  float haze[4];
+  float flames[kMaxHazeFlames][4];
 };
+
+// The flicker of a fire's light, as material_lit_mesh.hlsli's
+// FireLightFlicker computes it for the materials, so they waver together.
+float NoiseHash12(float x, float y) {
+  float p3[3] = {x * 0.1031f, y * 0.1031f, x * 0.1031f};
+  for (float& component : p3) {
+    component -= std::floor(component);
+  }
+  float d = p3[0] * (p3[1] + 33.33f) + p3[1] * (p3[2] + 33.33f) + p3[2] * (p3[0] + 33.33f);
+  for (float& component : p3) {
+    component += d;
+  }
+  float h = (p3[0] + p3[1]) * p3[2];
+  return h - std::floor(h);
+}
+
+float ValueNoise(float x, float y) {
+  float cell_x = std::floor(x), cell_y = std::floor(y);
+  float fx = x - cell_x, fy = y - cell_y;
+  float ux = fx * fx * (3.0f - 2.0f * fx), uy = fy * fy * (3.0f - 2.0f * fy);
+  float a = NoiseHash12(cell_x, cell_y), b = NoiseHash12(cell_x + 1.0f, cell_y);
+  float c = NoiseHash12(cell_x, cell_y + 1.0f), d = NoiseHash12(cell_x + 1.0f, cell_y + 1.0f);
+  return (a + (b - a) * ux) + ((c + (d - c) * ux) - (a + (b - a) * ux)) * uy;
+}
+
+float FireFlicker(const scene_lights::Light& light, float time) {
+  float seed = light.position[0] * 0.37f + light.position[1] * 0.13f + light.position[2] * 0.71f;
+  float flicker = ValueNoise(time * 7.3f, seed) * 0.6f + ValueNoise(time * 17.9f, seed + 31.0f) * 0.4f;
+  float brightest = std::max(light.color[0], 1.0e-4f);
+  float warmth = std::clamp((light.color[0] - light.color[2]) / brightest * 1.5f - 0.5f, 0.0f, 1.0f);
+  return 1.0f + (0.72f + 0.56f * flicker - 1.0f) * warmth;
+}
 
 // fx_effect_flags, scene_fx_debug and fx_composite_mode, as in
 // scene_fx_common.hlsli.
@@ -372,11 +428,13 @@ SceneEffects::~SceneEffects() = default;
 bool SceneEffects::AnySceneEffectEnabled() {
   return REXCVAR_GET(scene_fx_ao) || REXCVAR_GET(scene_fx_gi) ||
          REXCVAR_GET(scene_fx_contact_shadows) || REXCVAR_GET(scene_fx_reflections) ||
-         REXCVAR_GET(scene_fx_volumetrics) || REXCVAR_GET(scene_fx_fog);
+         REXCVAR_GET(scene_fx_volumetrics) || REXCVAR_GET(scene_fx_fog) ||
+         REXCVAR_GET(scene_fx_dynamic_lights) || REXCVAR_GET(scene_fx_fire);
 }
 
 bool SceneEffects::AnyImageEffectEnabled() {
-  return REXCVAR_GET(scene_fx_sharpen) || REXCVAR_GET(scene_fx_grading);
+  return REXCVAR_GET(scene_fx_sharpen) || REXCVAR_GET(scene_fx_grading) ||
+         REXCVAR_GET(scene_fx_fire);
 }
 
 bool SceneEffects::SunShadowsNeeded() {
@@ -592,18 +650,20 @@ void SceneEffects::OnResolve() {
     if (effects_frame_ != frame) {
       ComputeEffects(*source_rt, rect, screen_offset_x, screen_offset_y, trace);
     }
-    if (REXCVAR_GET(scene_fx_gi) || REXCVAR_GET(scene_fx_reflections)) {
+    if (REXCVAR_GET(scene_fx_gi) || REXCVAR_GET(scene_fx_reflections) || dynamic_lights_active_ ||
+        embers_active_) {
       CaptureSceneColor(*source_rt, rect, screen_offset_x, screen_offset_y);
     }
     if (debug_mode > kDebugSplit) {
       // Shown over the final image instead.
       return;
     }
-    if (ao_computed_ || gi_computed_ || contact_shadows_computed_ || fog_enabled_) {
+    if (ao_computed_ || gi_computed_ || contact_shadows_computed_ || fog_enabled_ ||
+        dynamic_lights_active_) {
       Composite(*source_rt, rect, screen_offset_x, screen_offset_y, 1.0f, 1.0f,
                 Draw::kCompositeMultiply, trace);
     }
-    if (fog_enabled_ || volumetrics_computed_ || reflections_computed_) {
+    if (fog_enabled_ || volumetrics_computed_ || reflections_computed_ || embers_active_) {
       Composite(*source_rt, rect, screen_offset_x, screen_offset_y, 1.0f, 1.0f,
                 Draw::kCompositeAdd, trace);
     }
@@ -1024,9 +1084,10 @@ void SceneEffects::ComputeEffects(RenderTarget& color_rt, const Rect& rect,
   bool gi = REXCVAR_GET(scene_fx_gi);
   bool fog = REXCVAR_GET(scene_fx_fog);
   bool volumetrics = REXCVAR_GET(scene_fx_volumetrics);
+  bool dynamic_lights = REXCVAR_GET(scene_fx_dynamic_lights);
 
   PrefilterDepth();
-  if (volumetrics || fog || gi) {
+  if (volumetrics || fog || gi || dynamic_lights) {
     EstimateSkyColor(color_rt, rect, screen_offset_x, screen_offset_y);
   }
   ao_computed_ = false;
@@ -1039,6 +1100,7 @@ void SceneEffects::ComputeEffects(RenderTarget& color_rt, const Rect& rect,
   reflections_computed_ = REXCVAR_GET(scene_fx_reflections) && ComputeReflections();
   volumetrics_computed_ = volumetrics && ComputeVolumetrics();
   fog_enabled_ = FillFogConstants() && fog;
+  FillLightConstants();
 
   // For the next frame's reprojection.
   if (camera_.has_matrix) {
@@ -1227,6 +1289,82 @@ bool SceneEffects::FillFogConstants() {
   return true;
 }
 
+void SceneEffects::FillLightConstants() {
+  dynamic_lights_active_ = false;
+  embers_active_ = false;
+  haze_flame_count_ = 0;
+  float(&info)[4] = composite_constants_[kCompositeLightRow];
+  std::memset(&composite_constants_[kCompositeLightRow], 0,
+              sizeof(float) * 4 * (1 + 2 * kMaxCompositeLights));
+  bool dynamic_lights = REXCVAR_GET(scene_fx_dynamic_lights);
+  bool fire = REXCVAR_GET(scene_fx_fire);
+  CameraBasis basis;
+  if ((!dynamic_lights && !fire) || !camera_.has_matrix || !GetCameraBasis(camera_.rows, basis)) {
+    return;
+  }
+  // In view space, those that can reach what's in view, nearest first.
+  struct ViewLight {
+    const scene_lights::Light* light;
+    float position[3];
+    float distance;
+  };
+  ViewLight view_lights[64];
+  uint32_t view_light_count = 0;
+  for (const scene_lights::Light& light : scene_lights::GetLights()) {
+    float offset[3] = {light.position[0] - basis.position[0], light.position[1] - basis.position[1],
+                       light.position[2] - basis.position[2]};
+    ViewLight view_light;
+    view_light.light = &light;
+    view_light.position[0] = Dot3(offset, basis.right);
+    view_light.position[1] = Dot3(offset, basis.up);
+    view_light.position[2] = Dot3(offset, basis.forward);
+    view_light.distance = Length3(view_light.position);
+    // Behind the camera beyond its reach.
+    if (view_light.position[2] < -light.radius || view_light_count >= 64) {
+      continue;
+    }
+    view_lights[view_light_count++] = view_light;
+  }
+  std::sort(view_lights, view_lights + view_light_count,
+            [](const ViewLight& a, const ViewLight& b) { return a.distance < b.distance; });
+  view_light_count = std::min(view_light_count, kMaxCompositeLights);
+  if (!view_light_count) {
+    return;
+  }
+  float time = material_shaders::GetTime();
+  float intensity = float(REXCVAR_GET(scene_fx_dynamic_lights_intensity));
+  float fire_intensity = float(REXCVAR_GET(scene_fx_fire_intensity));
+  bool any_fire = false;
+  for (uint32_t i = 0; i < view_light_count; ++i) {
+    const ViewLight& view_light = view_lights[i];
+    const scene_lights::Light& light = *view_light.light;
+    float(&position)[4] = composite_constants_[kCompositeLightRow + 1 + i * 2];
+    float(&color)[4] = composite_constants_[kCompositeLightRow + 2 + i * 2];
+    std::memcpy(position, view_light.position, sizeof(float) * 3);
+    position[3] = light.radius;
+    float flicker = light.is_fire ? FireFlicker(light, time) : 1.0f;
+    for (uint32_t j = 0; j < 3; ++j) {
+      color[j] = light.color[j] * flicker;
+    }
+    color[3] = light.is_fire ? 1.0f : 0.0f;
+    if (light.is_fire) {
+      any_fire = true;
+      if (haze_flame_count_ < kMaxHazeFlames && view_light.position[2] > 0.3f) {
+        std::memcpy(haze_flames_[haze_flame_count_++], view_light.position, sizeof(float) * 3);
+      }
+    }
+  }
+  info[0] = float(view_light_count);
+  info[1] = time;
+  info[2] = dynamic_lights ? intensity : 0.0f;
+  info[3] = fire && any_fire ? fire_intensity : 0.0f;
+  dynamic_lights_active_ = dynamic_lights && intensity > 0.0f;
+  embers_active_ = fire && any_fire && fire_intensity > 0.0f;
+  if (!fire || fire_intensity <= 0.0f) {
+    haze_flame_count_ = 0;
+  }
+}
+
 void SceneEffects::EstimateSkyColor(RenderTarget& color_rt, const Rect& rect,
                                     int32_t screen_offset_x, int32_t screen_offset_y) {
   Texture previous = sky_index_ ? Texture::kSky1 : Texture::kSky0;
@@ -1317,7 +1455,9 @@ void SceneEffects::ApplyImageEffects(RenderTarget& color_rt, const Rect& rect, u
                                      uint32_t height, bool trace) {
   bool sharpen = REXCVAR_GET(scene_fx_sharpen);
   bool grading = REXCVAR_GET(scene_fx_grading);
-  if (!sharpen && !grading) {
+  bool haze = REXCVAR_GET(scene_fx_fire) && haze_flame_count_ &&
+              effects_frame_ == GetCurrentFrame() && scene_width_ && scene_height_;
+  if (!sharpen && !grading && !haze) {
     return;
   }
   // The image, copied to read its neighborhoods.
@@ -1357,6 +1497,28 @@ void SceneEffects::ApplyImageEffects(RenderTarget& color_rt, const Rect& rect, u
     ic.finish[0] = float(REXCVAR_GET(scene_fx_grading_shadow_lift));
     ic.finish[1] = float(REXCVAR_GET(scene_fx_vignette));
     ic.finish[2] = float(REXCVAR_GET(scene_fx_film_grain));
+  }
+  if (haze) {
+    // The flames' bases from view space to the final image's pixels.
+    float scale_x = float(width) / float(scene_width_);
+    float scale_y = float(height) / float(scene_height_);
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < haze_flame_count_; ++i) {
+      const float* position = haze_flames_[i];
+      float ndc_x = position[0] / (position[2] * camera_.inv_p00);
+      float ndc_y = position[1] / (position[2] * camera_.inv_p11);
+      if (std::abs(ndc_x) > 1.5f || std::abs(ndc_y) > 1.5f) {
+        continue;
+      }
+      ic.flames[count][0] = (ndc_x * 0.5f + 0.5f) * float(scene_width_) * scale_x;
+      ic.flames[count][1] = (ndc_y * -0.5f + 0.5f) * float(scene_height_) * scale_y;
+      ic.flames[count][2] =
+          0.5f * float(scene_height_) / (position[2] * camera_.inv_p11) * scale_y;
+      ++count;
+    }
+    ic.haze[0] = float(count);
+    ic.haze[1] = material_shaders::GetTime();
+    ic.haze[2] = float(REXCVAR_GET(scene_fx_fire_intensity));
   }
   if (trace) {
     REXGPU_INFO("Scene effects trace: image effects (sharpen {}, grading {}) on {}x{}", sharpen,

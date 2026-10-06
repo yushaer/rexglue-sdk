@@ -95,6 +95,9 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
+  // The guest memory (texture packs hash textures' data in it).
+  memory::Memory& guest_memory() const { return memory_; }
+
  protected:
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.

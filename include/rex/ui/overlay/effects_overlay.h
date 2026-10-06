@@ -29,6 +29,9 @@ class EffectsDialog : public ImGuiDialog {
  private:
   void ApplyPreset(int preset);
   void ResetToDefaults();
+  // The options shaders and mods declare (options.toml), and the mods.
+  void DrawShaderOptions();
+  void DrawMods();
 
   std::filesystem::path config_path_;
   std::string status_;

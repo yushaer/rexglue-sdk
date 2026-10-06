@@ -9,8 +9,13 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string_view>
 #include <vector>
+
+namespace rex::graphics {
+class Shader;
+}  // namespace rex::graphics
 
 namespace rex::graphics::material_shaders {
 
@@ -31,18 +36,93 @@ namespace rex::graphics::material_shaders {
 // 0.y - Soft shadow light size scale.
 // 0.z - Specular intensity.
 // 0.w - Surface roughness.
-// 1, 2 - Reserved.
+// 1.x - Time in seconds (wrapped hourly), the same for a whole frame.
+// 1.y - Sky sheen intensity on characters.
+// 1.z - Foliage translucency.
+// 1.w - Fire core intensity.
+// 2.x - Traits of the draw's vertex shader (uint bits, VertexShaderTrait) - to
+//       tell characters (skinned) from props with the same pixel shader.
+// 2.y - The draw's vertex shader hash, low 32 bits (uint).
+// 2.zw - Reserved.
 // 3.x, 3.y - Draw resolution scale.
 // 3.z - Translation flags (uint bits, TranslationFlag) - what the translator
 //       bakes into its shaders.
 // 3.w - Reserved.
-constexpr uint32_t kMaterialParamsCount = 4;
+// 4-11 - The shader options: 32 floats, slot i in [4 + i / 4][i % 4], declared
+//        in options.toml (see LoadOptions) and set in the menu.
+// 12-13 - The custom textures (textures.toml): slot i's bindless descriptor
+//         index (uint) in [12 + i / 4][i % 4], or kNoTexture.
+// 14-21 - Companion maps of the textures in fetch constants 0-7: [14 + fetch]
+//         = the descriptor indices (uint) of its CompanionMap kinds, or
+//         kNoTexture.
+constexpr uint32_t kMaterialParamsCount = 22;
+constexpr uint32_t kOptionSlotCount = 32;
+constexpr uint32_t kCustomTextureSlotCount = 8;
+constexpr uint32_t kCompanionFetchCount = 8;
+constexpr uint32_t kNoTexture = UINT32_MAX;
+
+// Maps a texture pack adds to a game texture, named <hash>_<kind>.png (or
+// .dds) beside its replacement (texture_replacement.h).
+enum CompanionMap : uint32_t {
+  // Tangent-space normals in RG (as the game's own normal maps).
+  kCompanionMapNormal,
+  // Occlusion, roughness, metalness in RGB ("_orm").
+  kCompanionMapOrm,
+  // Height in R, for parallax.
+  kCompanionMapHeight,
+  // Light given off, RGB.
+  kCompanionMapEmissive,
+  kCompanionMapCount,
+};
+
+// options.toml in the material folders declares the options shaders read
+// (XeMaterialOption(slot) in xenos_d3d12.hlsli):
+//   [[option]]
+//   id = "character_rim"        # unique, the key in material_options
+//   slot = 0                    # 0-31
+//   label = "Rim light"
+//   group = "Characters"
+//   description = "..."
+//   type = "slider"             # or "checkbox" (0 or 1)
+//   default = 1.0
+//   min = 0.0
+//   max = 2.0
+// The values set differ from the defaults in material_options ("id=value,...").
+// textures.toml lists custom textures for shaders (noise, lookup tables...):
+//   [[texture]]
+//   slot = 0                    # 0-7
+//   file = "textures/blue_noise.png"   # relative to that folder
+// The first declaration of an id or slot (mods first) wins.
+
+// (Re)reads options.toml and textures.toml.
+void LoadOptions();
+// A custom texture slot's file, if declared.
+struct CustomTexture {
+  uint32_t slot;
+  std::filesystem::path path;
+};
+const std::vector<CustomTexture>& GetCustomTextures();
 
 enum MaterialFeature : uint32_t {
   // Penumbras that widen with the distance from the caster.
   kMaterialFeatureSoftShadows = 1u << 0,
   // GGX specular with Fresnel instead of the game's Phong.
   kMaterialFeatureSpecular = 1u << 1,
+  // Characters: wrapped diffuse and the sky's sheen at grazing angles.
+  kMaterialFeatureCharacterLighting = 1u << 2,
+  // Foliage: translucency, wrapped diffuse, mip-corrected alpha.
+  kMaterialFeatureFoliage = 1u << 3,
+  // Fire: animated turbulence and brighter cores.
+  kMaterialFeatureFire = 1u << 4,
+};
+
+enum VertexShaderTrait : uint32_t {
+  // Indexes float constants dynamically (particles, instancing, some props).
+  kVertexShaderTraitIndexedConstants = 1u << 0,
+  // Fetches a vertex stream at several indices per vertex - blending bones
+  // from a matrix palette: skinned characters and creatures (rigid props with
+  // one bone each don't count).
+  kVertexShaderTraitSkinned = 1u << 1,
 };
 
 enum TranslationFlag : uint32_t {
@@ -55,13 +135,44 @@ enum TranslationFlag : uint32_t {
 // Whether material shaders replace translations (read when translating).
 bool IsEnabled();
 
+// The material shaders' folder (material_shaders_path, from the executable's).
+std::filesystem::path GetFolder();
+
+// The enabled mods' folders, the highest priority first (rex/system/mods.h,
+// published in the mods_folders cvar).
+std::vector<std::filesystem::path> GetModFolders();
+
+// The folders with material shaders, the first found winning: each enabled
+// mod's materials folder, then GetFolder().
+std::vector<std::filesystem::path> GetFolders();
+
+// Asks the backend to read the material shaders again (material_shaders_reload).
+void RequestReload();
+
+// Whether the material shaders must be read again - a reload was requested, or
+// material_shaders was toggled since the last call. Called by the backend once
+// per frame; clears the request.
+bool ConsumeReloadRequest();
+
+// Advances the time the materials animate with. Called by the backend once per
+// frame.
+void AdvanceFrame();
+
+// The time the materials animate with this frame (material_params 1.x).
+float GetTime();
+
 // The material shader for a translation, if there is one. backend: the
 // subdirectory ("d3d12"), extension: the file extension ("dxbc").
 bool Load(uint64_t ucode_hash, uint64_t modification, std::string_view backend,
           std::string_view extension, std::vector<uint8_t>& binary_out);
 
-// The system constants' material parameters for the current settings.
+// The VertexShaderTrait bits of an analyzed vertex shader.
+uint32_t GetVertexShaderTraits(const Shader& vertex_shader);
+
+// The system constants' material parameters for the current settings and draw
+// (rows 0-11 - the backend fills the texture rows).
 void GetParams(float params_out[kMaterialParamsCount][4], uint32_t draw_resolution_scale_x,
-               uint32_t draw_resolution_scale_y, uint32_t translation_flags);
+               uint32_t draw_resolution_scale_y, uint32_t translation_flags,
+               uint32_t vertex_shader_traits, uint64_t vertex_shader_hash);
 
 }  // namespace rex::graphics::material_shaders

@@ -23,6 +23,7 @@
 #include <rex/system/export_resolver.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/function_dispatcher.h>
+#include <rex/system/mods.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xmemory.h>
 #include <rex/system/xthread.h>
@@ -310,6 +311,15 @@ bool Runtime::SetupVfs() {
   if (!device->Initialize()) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize host path device");
     return false;
+  }
+  // Mods' game files over the game's - the highest priority laid last.
+  rex::mods::Initialize();
+  std::vector<std::filesystem::path> mod_folders = rex::mods::GetEnabledFolders();
+  for (auto it = mod_folders.rbegin(); it != mod_folders.rend(); ++it) {
+    uint32_t file_count = device->AddOverlay(*it / "files");
+    if (file_count) {
+      REXSYS_INFO("Mods: {} game files from {}", file_count, it->u8string());
+    }
   }
   if (!file_system_->RegisterDevice(std::move(device))) {
     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");

@@ -230,6 +230,11 @@ class TextureCache {
 
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
 
+    // The hash of the base level's guest data when last loaded, for texture
+    // packs (texture_replacement.h) - 0 if not computed.
+    uint64_t content_hash() const { return content_hash_; }
+    void set_content_hash(uint64_t content_hash) { content_hash_ = content_hash; }
+
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
     // referenced by any GPU work in the implementation to make sure it's not
@@ -262,6 +267,7 @@ class TextureCache {
     Texture* used_next_;
     bool in_usage_list_;
     bool force_load_3d_tiling_ = false;
+    uint64_t content_hash_ = 0;
 
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
@@ -454,6 +460,9 @@ class TextureCache {
     TextureKey key;
     // Destination swizzle merged with guest to host format swizzle.
     uint32_t host_swizzle;
+    // The fetch constant's destination swizzle alone (for replacement
+    // textures, whose host format swizzle is the identity).
+    uint32_t guest_swizzle;
     // Packed TextureSign values, 2 bit per each component, with guest-side
     // destination swizzle from the fetch constant applied to them.
     uint8_t swizzled_signs;
@@ -527,6 +536,18 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
+
+  // Texture packs (texture_replacement.h). Makes the texture show the
+  // replacement for its content hash if there is one (true - then the guest
+  // data isn't loaded), or stop showing one (false).
+  virtual bool ApplyTextureReplacement(Texture& /*texture*/, uint64_t /*content_hash*/) {
+    return false;
+  }
+  // After the guest data is loaded, for dump_textures.
+  virtual void DumpTexture(Texture& /*texture*/, uint64_t /*content_hash*/) {}
+  // Whether textures with this key may be replaced or dumped (2D, not resolve
+  // targets).
+  static bool IsTextureReplaceable(const TextureKey& key);
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the

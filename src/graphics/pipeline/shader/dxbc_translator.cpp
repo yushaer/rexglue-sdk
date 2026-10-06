@@ -1930,6 +1930,9 @@ const DxbcShaderTranslator::ShaderRdefType
         // dynamically.
         {nullptr, dxbc::RdefVariableClass::kVector, dxbc::RdefVariableType::kUInt, 1, 4, 0,
          ShaderRdefTypeIndex::kUint4},
+        // kFloat4MaterialParamsArray
+        {nullptr, dxbc::RdefVariableClass::kVector, dxbc::RdefVariableType::kFloat, 1, 4,
+         kMaterialParamsVectorCount, ShaderRdefTypeIndex::kFloat4},
 };
 
 const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_constant_rdef_[size_t(
@@ -1983,7 +1986,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
 
-    {"xe_material_params", ShaderRdefTypeIndex::kFloat4Array4, sizeof(float) * 4 * 4},
+    {"xe_material_params", ShaderRdefTypeIndex::kFloat4MaterialParamsArray,
+     sizeof(float) * 4 * kMaterialParamsVectorCount},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {

@@ -31,6 +31,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/scene_lights.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
@@ -265,7 +266,7 @@ void FrameLogOnSwap() {
           pass.shaders.begin(), pass.shaders.end());
       std::sort(shaders.begin(), shaders.end(),
                 [](const auto& a, const auto& b) { return a.second > b.second; });
-      for (size_t j = 0; j < shaders.size() && j < 8; ++j) {
+      for (size_t j = 0; j < shaders.size(); ++j) {
         fmt::print(file, "      vs={:016X} ps={:016X} x{}\n", shaders[j].first.first,
                    shaders[j].first.second, shaders[j].second);
       }
@@ -1229,6 +1230,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   FrameLogOnSwap();
+  scene_lights::OnFrameSwap();
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -1677,6 +1679,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
       FrameLogRecordDraw(*register_file_, active_vertex_shader_, active_pixel_shader_);
+      scene_lights::OnDraw(*register_file_, active_pixel_shader_);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
