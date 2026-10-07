@@ -27,15 +27,15 @@ REXCVAR_DEFINE_STRING(mods_folders, "", "Mods",
                       "Set at startup: the enabled mods' folders, the highest priority first, "
                       "separated by |")
     .transient();
-REXCVAR_DEFINE_COMMAND(mods_reload,
-                       [] {
-                         rex::mods::Initialize();
-                         rex::cvar::InvokeCommand("texture_replacement_reload", "");
-                         rex::cvar::InvokeCommand("material_shaders_reload", "");
-                       },
-                       "Mods",
-                       "Find the mods again, and reload their textures and shaders (their game "
-                       "files apply at the next start)");
+REXCVAR_DEFINE_COMMAND(
+    mods_reload,
+    [] {
+      rex::mods::Initialize();
+      rex::cvar::InvokeCommand("material_shaders_reload", "");
+    },
+    "Mods",
+    "Find the mods again, and reload their material shaders, shader options "
+    "and lights (texture packs and game files apply at the next start)");
 
 namespace rex::mods {
 

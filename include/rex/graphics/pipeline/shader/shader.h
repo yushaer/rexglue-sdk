@@ -814,10 +814,18 @@ class Shader {
       translated_binary_ = std::move(original_binary_);
       original_binary_ = {};
       is_binary_replaced_ = false;
+      uses_layer_blending_ = false;
       host_disassembly_.clear();
     }
 
     bool is_binary_replaced() const { return is_binary_replaced_; }
+
+    // Whether the material shader replacing the translation blends layers
+    // (rex/graphics/pipeline/material_shaders.h) - set along with the binary.
+    bool uses_layer_blending() const { return uses_layer_blending_; }
+    void SetUsesLayerBlending(bool uses_layer_blending) {
+      uses_layer_blending_ = uses_layer_blending;
+    }
 
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
@@ -846,6 +854,7 @@ class Shader {
     // The translator's code while a material shader replaces it.
     std::vector<uint8_t> original_binary_;
     bool is_binary_replaced_ = false;
+    bool uses_layer_blending_ = false;
     std::string host_disassembly_;
   };
 

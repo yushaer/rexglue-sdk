@@ -40,16 +40,16 @@
 #include <rex/graphics/pipeline/material_shaders.h>
 #include <rex/logging.h>
 
+// Texture packs are read once, at startup: replacing the textures - and the
+// maps material shaders sample - of a running game isn't supported.
 REXCVAR_DEFINE_BOOL(texture_replacement, true, "GPU/Textures",
                     "Replace the game's textures with those in mods' textures folders (and "
-                    "<executable folder>/textures)");
+                    "<executable folder>/textures)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(dump_textures, "", "GPU/Textures",
                       "Write each 2D texture the game loads to this folder as <hash>.png, for "
                       "making replacements")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_COMMAND(texture_replacement_reload,
-                       [] { rex::graphics::texture_replacement::RequestReload(); },
-                       "GPU/Textures", "Scan the replacement textures again and reload textures");
 
 namespace rex::graphics::texture_replacement {
 
@@ -80,7 +80,12 @@ std::optional<uint32_t> ParseCompanionKind(const std::filesystem::path& path) {
   }
   return std::nullopt;
 }
-std::atomic<bool> reload_requested{false};
+
+// texture_replacement as it was at startup (it applies after restarting).
+bool Enabled() {
+  static const bool enabled = REXCVAR_GET(texture_replacement);
+  return enabled;
+}
 
 std::mutex dump_mutex;
 std::unordered_set<uint64_t> dumped;
@@ -369,7 +374,7 @@ bool LoadDds(const std::vector<uint8_t>& file, Image& image) {
 }  // namespace
 
 bool IsEnabled() {
-  if (!REXCVAR_GET(texture_replacement)) {
+  if (!Enabled()) {
     return false;
   }
   EnsureScanned();
@@ -426,7 +431,7 @@ void Rescan() {
 }
 
 std::optional<std::filesystem::path> FindCompanion(uint64_t hash, uint32_t kind) {
-  if (kind >= kCompanionKindCount || !REXCVAR_GET(texture_replacement)) {
+  if (kind >= kCompanionKindCount || !Enabled()) {
     return std::nullopt;
   }
   EnsureScanned();
@@ -438,9 +443,6 @@ std::optional<std::filesystem::path> FindCompanion(uint64_t hash, uint32_t kind)
   return it->second;
 }
 
-void RequestReload() { reload_requested.store(true, std::memory_order_relaxed); }
-
-bool ConsumeReloadRequest() { return reload_requested.exchange(false, std::memory_order_relaxed); }
 
 std::optional<std::filesystem::path> Find(uint64_t hash) {
   EnsureScanned();

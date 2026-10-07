@@ -19,6 +19,7 @@
 #include <deque>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1239,11 +1240,40 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
     std::vector<uint8_t> material_binary;
     if (material_shaders::Load(shader.ucode_data_hash(), translation.modification(), "d3d12",
                                "dxbc", material_binary)) {
-      translation.ReplaceTranslatedBinary(std::move(material_binary));
+      ReplaceWithMaterialShader(translation, std::move(material_binary));
     }
   }
 
   return translation.is_valid();
+}
+
+bool PipelineCache::ReplaceWithMaterialShader(D3D12Shader::D3D12Translation& translation,
+                                              std::vector<uint8_t> binary) {
+  // Layer blending shaders declare the sums buffer, which leaves its name in
+  // the binary's resource table.
+  std::string_view name(material_shaders::kLayerSumsName);
+  bool layer_blending =
+      std::search(binary.begin(), binary.end(), name.begin(), name.end()) != binary.end();
+  if (layer_blending &&
+      !(bindless_resources_used_ &&
+        render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+        command_processor_.GetD3D12Provider().AreRasterizerOrderedViewsSupported())) {
+    REXGPU_WARN(
+        "Material shader for {:016X} blends layers, which needs rasterizer ordered views and "
+        "bindless resources - using the game's shader",
+        translation.shader().ucode_data_hash());
+    return false;
+  }
+  translation.ReplaceTranslatedBinary(std::move(binary));
+  translation.SetUsesLayerBlending(layer_blending);
+  return true;
+}
+
+bool PipelineCache::IsLayerBlendingTarget(const PipelineDescription& description) {
+  // Dual-source blending takes render target 0 alone.
+  return description.render_targets[0].used && description.render_targets[0].write_mask &&
+         !description.render_targets[1].used && !description.render_targets[2].used &&
+         !description.render_targets[3].used;
 }
 
 void PipelineCache::ReloadMaterialShaders() {
@@ -1267,7 +1297,12 @@ void PipelineCache::ReloadMaterialShaders() {
         if (translation.translated_binary() == material_binary) {
           continue;
         }
-        translation.ReplaceTranslatedBinary(std::move(material_binary));
+        if (!ReplaceWithMaterialShader(translation, std::move(material_binary))) {
+          if (!translation.is_binary_replaced()) {
+            continue;
+          }
+          translation.RestoreTranslatedBinary();
+        }
       } else {
         if (!translation.is_binary_replaced()) {
           continue;
@@ -3087,7 +3122,13 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
 
     // Render targets and blending.
-    state_desc.BlendState.IndependentBlendEnable = TRUE;
+    // Layer blending (material_shaders.h): color + destination * the second
+    // color's alpha, or the color alone for the first layer (where the game's
+    // blending replaces the destination); the alpha blended as the game does.
+    bool layer_blending = runtime_description.pixel_shader != nullptr &&
+                          runtime_description.pixel_shader->uses_layer_blending() &&
+                          IsLayerBlendingTarget(description);
+    state_desc.BlendState.IndependentBlendEnable = layer_blending ? FALSE : TRUE;
     static const D3D12_BLEND kBlendFactorMap[] = {
         D3D12_BLEND_ZERO,          D3D12_BLEND_ONE,
         D3D12_BLEND_SRC_COLOR,     D3D12_BLEND_INV_SRC_COLOR,
@@ -3117,11 +3158,21 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         return nullptr;
       }
       D3D12_RENDER_TARGET_BLEND_DESC& blend_desc = state_desc.BlendState.RenderTarget[i];
-      if (rt.src_blend != PipelineBlendFactor::kOne ||
-          rt.dest_blend != PipelineBlendFactor::kZero || rt.blend_op != xenos::BlendOp::kAdd ||
-          rt.src_blend_alpha != PipelineBlendFactor::kOne ||
-          rt.dest_blend_alpha != PipelineBlendFactor::kZero ||
-          rt.blend_op_alpha != xenos::BlendOp::kAdd) {
+      if (layer_blending) {
+        blend_desc.BlendEnable = TRUE;
+        blend_desc.SrcBlend = D3D12_BLEND_ONE;
+        blend_desc.DestBlend =
+            rt.dest_blend == PipelineBlendFactor::kZero ? D3D12_BLEND_ZERO : D3D12_BLEND_SRC1_ALPHA;
+        blend_desc.BlendOp = D3D12_BLEND_OP_ADD;
+        blend_desc.SrcBlendAlpha = kBlendFactorMap[uint32_t(rt.src_blend_alpha)];
+        blend_desc.DestBlendAlpha = kBlendFactorMap[uint32_t(rt.dest_blend_alpha)];
+        blend_desc.BlendOpAlpha = kBlendOpMap[uint32_t(rt.blend_op_alpha)];
+      } else if (rt.src_blend != PipelineBlendFactor::kOne ||
+                 rt.dest_blend != PipelineBlendFactor::kZero ||
+                 rt.blend_op != xenos::BlendOp::kAdd ||
+                 rt.src_blend_alpha != PipelineBlendFactor::kOne ||
+                 rt.dest_blend_alpha != PipelineBlendFactor::kZero ||
+                 rt.blend_op_alpha != xenos::BlendOp::kAdd) {
         blend_desc.BlendEnable = TRUE;
         blend_desc.SrcBlend = kBlendFactorMap[uint32_t(rt.src_blend)];
         blend_desc.DestBlend = kBlendFactorMap[uint32_t(rt.dest_blend)];

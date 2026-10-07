@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -127,6 +128,7 @@ struct FrameLogPass {
   uint32_t draws = 0;
   std::map<std::pair<uint64_t, uint64_t>, uint32_t> shaders;  // (vs, ps) -> draws
   std::vector<std::string> constant_dumps;  // gpu_frame_log_constants
+  std::set<uint64_t> constants_dumped;      // their pixel shaders
 };
 
 struct FrameLog {
@@ -200,9 +202,17 @@ std::string DescribeResolve(const RegisterFile& regs) {
       uint32_t(scissor_tl.tl_y), uint32_t(scissor_br.br_x), uint32_t(scissor_br.br_y));
 }
 
-// All 512 float constants (256 vertex, then 256 pixel) as one line each.
+// The draw's render target 0 blending (Xenos BlendFactor / BlendOp numbers),
+// then all 512 float constants (256 vertex, then 256 pixel) as one line each.
 std::string DumpFloatConstants(const RegisterFile& regs, uint64_t pixel_shader_hash) {
-  std::string text = fmt::format("      constants for ps={:016X}:\n", pixel_shader_hash);
+  auto blend = regs.Get<reg::RB_BLENDCONTROL>(XE_GPU_REG_RB_BLENDCONTROL0);
+  std::string text = fmt::format(
+      "      constants for ps={:016X} (rt0 blend: color src {} op {} dest {}, alpha src {} op {} "
+      "dest {}; color mask {:04X}; color control {:08X}):\n",
+      pixel_shader_hash, uint32_t(blend.color_srcblend), uint32_t(blend.color_comb_fcn),
+      uint32_t(blend.color_destblend), uint32_t(blend.alpha_srcblend),
+      uint32_t(blend.alpha_comb_fcn), uint32_t(blend.alpha_destblend),
+      regs.Get<reg::RB_COLOR_MASK>().value, regs.Get<reg::RB_COLORCONTROL>().value);
   for (uint32_t i = 0; i < 512; ++i) {
     const float* c = reinterpret_cast<const float*>(
         &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + i * 4]);
@@ -231,9 +241,11 @@ void FrameLogRecordDraw(const RegisterFile& regs, const Shader* vertex_shader,
   if (!resolve) {
     uint64_t pixel_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
     ++pass.shaders[{vertex_shader ? vertex_shader->ucode_data_hash() : 0, pixel_hash}];
+    // The first draw of each wanted shader in the pass.
     const std::string& wanted = REXCVAR_GET(gpu_frame_log_constants);
-    if (pixel_hash && !wanted.empty() && pass.constant_dumps.size() < 2 &&
-        wanted.find(fmt::format("{:016X}", pixel_hash)) != std::string::npos) {
+    if (pixel_hash && !wanted.empty() &&
+        wanted.find(fmt::format("{:016X}", pixel_hash)) != std::string::npos &&
+        pass.constants_dumped.insert(pixel_hash).second) {
       pass.constant_dumps.push_back(DumpFloatConstants(regs, pixel_hash));
     }
   }

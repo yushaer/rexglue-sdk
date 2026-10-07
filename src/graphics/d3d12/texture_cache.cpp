@@ -2310,19 +2310,19 @@ void D3D12TextureCache::ReleaseStandaloneTextures() {
   standalone_textures_.clear();
 }
 
-void D3D12TextureCache::GetCompanionDescriptors(uint32_t fetch_constant,
-                                                uint32_t descriptors_out[4]) {
+uint64_t D3D12TextureCache::GetCompanionDescriptors(uint32_t fetch_constant,
+                                                    uint32_t descriptors_out[4]) {
   for (uint32_t kind = 0; kind < 4; ++kind) {
     descriptors_out[kind] = UINT32_MAX;
   }
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant);
   if (!binding || !binding->texture) {
-    return;
+    return 0;
   }
   D3D12Texture& texture = *static_cast<D3D12Texture*>(binding->texture);
   uint64_t content_hash = texture.content_hash();
   if (!content_hash) {
-    return;
+    return 0;
   }
   if (texture.companion_hash() != content_hash) {
     uint32_t descriptors[4];
@@ -2334,6 +2334,12 @@ void D3D12TextureCache::GetCompanionDescriptors(uint32_t fetch_constant,
     texture.SetCompanions(content_hash, descriptors);
   }
   texture.GetCompanions(descriptors_out);
+  for (uint32_t kind = 0; kind < 4; ++kind) {
+    if (descriptors_out[kind] != UINT32_MAX) {
+      return content_hash;
+    }
+  }
+  return 0;
 }
 
 void D3D12TextureCache::DumpTexture(Texture& texture, uint64_t content_hash) {

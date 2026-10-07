@@ -95,7 +95,8 @@ class D3D12TextureCache final : public TextureCache {
 
   // Texture packs' companion maps of the texture in a fetch constant: bindless
   // descriptor indices (or UINT32_MAX) in material_shaders::CompanionMap order.
-  void GetCompanionDescriptors(uint32_t fetch_constant, uint32_t descriptors_out[4]);
+  // Returns the texture's content hash if it has any, otherwise 0.
+  uint64_t GetCompanionDescriptors(uint32_t fetch_constant, uint32_t descriptors_out[4]);
   // A texture from an image file (custom textures for shaders, companion
   // maps), loaded once: its bindless descriptor index, or UINT32_MAX.
   uint32_t GetStandaloneTextureDescriptor(const std::filesystem::path& path);

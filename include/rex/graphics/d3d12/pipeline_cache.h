@@ -300,6 +300,14 @@ class PipelineCache {
   static void CreateDxbcGeometryShader(GeometryShaderKey key, std::vector<uint32_t>& shader_out);
   const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
 
+  // Puts a material shader in the translation's place, unless it needs
+  // something unavailable (layer blending). Returns whether it did.
+  bool ReplaceWithMaterialShader(D3D12Shader::D3D12Translation& translation,
+                                 std::vector<uint8_t> binary);
+  // Whether a pipeline draws to render target 0 alone, as layer blending
+  // (dual-source) needs - D3D12CommandProcessor checks the same.
+  static bool IsLayerBlendingTarget(const PipelineDescription& description);
+
   ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description);
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);

@@ -337,7 +337,8 @@ void EffectsDialog::DrawShaderOptions() {
 void EffectsDialog::DrawMods() {
   Description(
       "Mods in the mods folder: game files, texture packs (with normal, roughness and height "
-      "maps), and shaders. Turning one on or off fully applies at the next start.");
+      "maps), and shaders. Turning one on or off, and texture pack changes, apply at the next "
+      "start; Reload picks up shader changes now.");
   const std::vector<rex::mods::ModInfo>& mods = rex::mods::GetMods();
   if (mods.empty()) {
     ImGui::TextUnformatted("No mods installed.");
@@ -348,7 +349,7 @@ void EffectsDialog::DrawMods() {
     std::string label = mod.name + (mod.version.empty() ? "" : " " + mod.version);
     if (ImGui::Checkbox(label.c_str(), &enabled)) {
       rex::mods::SetEnabled(mod.id, enabled);
-      status_ = "Mods change at the next start (or Reload for textures and shaders)";
+      status_ = "Mods change at the next start (Reload applies their shaders now)";
     }
     std::string details;
     if (!mod.author.empty()) {
@@ -364,12 +365,12 @@ void EffectsDialog::DrawMods() {
     }
     ImGui::PopID();
   }
-  if (HasCvar("mods_reload") && ImGui::Button("Reload mods")) {
+  if (HasCvar("mods_reload") && ImGui::Button("Reload mods' shaders")) {
     rex::cvar::InvokeCommand("mods_reload", "");
-    status_ = "Mods reloaded (textures and shaders)";
+    status_ = "Shaders, shader options and lights reloaded (textures at the next start)";
   }
   if (HasCvar("texture_replacement")) {
-    CheckboxCvar("Texture packs", "texture_replacement");
+    CheckboxCvar("Texture packs (applies after restarting)", "texture_replacement");
     bool dumping = !rex::cvar::GetFlagByName("dump_textures").empty();
     if (ImGui::Checkbox("Dump textures for modding", &dumping)) {
       rex::cvar::SetFlagByName("dump_textures", dumping ? "texture_dump" : "");

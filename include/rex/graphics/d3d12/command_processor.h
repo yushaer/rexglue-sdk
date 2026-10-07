@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -154,6 +155,9 @@ class D3D12CommandProcessor : public CommandProcessor {
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
+
+    // Material shaders' layer blending sums (material_shaders.h), raw.
+    kMaterialLayerSumsUAV,
 
     // Beyond this point, SRVs are accessible to shaders through an unbounded
     // range - no descriptors of other types bound to shaders alongside
@@ -369,7 +373,9 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   const draw_util::ViewportInfo& viewport_info,
                                   uint32_t used_texture_mask,
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
-                                  uint32_t normalized_color_mask);
+                                  uint32_t normalized_color_mask, bool layer_blending);
+  // The material shaders' layer blending sums buffer, created on first use.
+  bool EnsureMaterialLayerSums();
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
@@ -652,6 +658,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t custom_texture_descriptors_[8] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX,
                                              UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   uint32_t custom_texture_generation_ = UINT32_MAX;
+  // Texture, pixel shader and fetch constant combinations of textures with maps
+  // already logged.
+  std::unordered_set<uint64_t> companion_uses_logged_;
+  // Layer blending: per-pixel running sums of the layers drawn (2 floats each,
+  // rows of material_layer_sums_pitch_ pixels), always in the UAV state.
+  Microsoft::WRL::ComPtr<ID3D12Resource> material_layer_sums_;
+  uint32_t material_layer_sums_pitch_ = 0;
+  uint32_t material_layer_sums_height_ = 0;
+  bool material_layer_sums_failed_ = false;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

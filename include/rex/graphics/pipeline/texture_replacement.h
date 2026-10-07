@@ -55,17 +55,12 @@ struct Image {
   std::vector<uint8_t> data;
 };
 
-// Whether replacements are used (texture_replacement) and any were found.
+// Whether replacements are used (texture_replacement, as at startup) and any
+// were found. Texture packs are read once: changes apply after restarting.
 bool IsEnabled();
 
-// (Re)scans the replacement folders. Called at startup and by
-// RequestReload's consumer.
+// Scans the replacement folders (once, on first use).
 void Rescan();
-
-// texture_replacement_reload: scan again, and reload the textures.
-void RequestReload();
-// Whether a reload was requested since the last call (clears it).
-bool ConsumeReloadRequest();
 
 // The replacement file for a texture, if any.
 std::optional<std::filesystem::path> Find(uint64_t hash);

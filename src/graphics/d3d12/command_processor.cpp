@@ -1111,7 +1111,7 @@ bool D3D12CommandProcessor::SetupContext() {
       root_bindless_sampler_range.OffsetInDescriptorsFromTableStart = 0;
     }
     // View heap.
-    D3D12_DESCRIPTOR_RANGE root_bindless_view_ranges[4];
+    D3D12_DESCRIPTOR_RANGE root_bindless_view_ranges[5];
     {
       auto& parameter = root_parameters_bindless[kRootParameter_Bindless_ViewHeap];
       parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -1129,6 +1129,17 @@ bool D3D12CommandProcessor::SetupContext() {
         range.BaseShaderRegister = UINT(DxbcShaderTranslator::UAVRegister::kEdram);
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kEdramR32UintUAV);
+      }
+      // Material shaders' layer blending sums.
+      {
+        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
+                    rex::countof(root_bindless_view_ranges));
+        auto& range = root_bindless_view_ranges[parameter.DescriptorTable.NumDescriptorRanges++];
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        range.NumDescriptors = 1;
+        range.BaseShaderRegister = 0;
+        range.RegisterSpace = material_shaders::kLayerSumsRegisterSpace;
+        range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kMaterialLayerSumsUAV);
       }
       // Used UAV and SRV ranges must not overlap on Nvidia Fermi, so textures
       // have OffsetInDescriptorsFromTableStart after all static descriptors of
@@ -1508,6 +1519,12 @@ bool D3D12CommandProcessor::SetupContext() {
         device,
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kNullRawUAV)),
+        nullptr, 0);
+    // kMaterialLayerSumsUAV - null until a layer blending shader is drawn.
+    ui::d3d12::util::CreateBufferRawUAV(
+        device,
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kMaterialLayerSumsUAV)),
         nullptr, 0);
     // kNullTexture2DArray.
     D3D12_SHADER_RESOURCE_VIEW_DESC null_srv_desc;
@@ -2477,12 +2494,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
+  // Material shaders' layer blending - the pipeline cache sets the blending up
+  // for the same draws (PipelineCache::IsLayerBlendingTarget: render target 0
+  // alone).
+  bool layer_blending =
+      pixel_shader_translation && pixel_shader_translation->uses_layer_blending() &&
+      host_render_targets_used && (bound_depth_and_color_render_target_bits >> 1) == 1 &&
+      (normalized_color_mask & 0xF) != 0;
+
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
-  UpdateSystemConstantValues(memexport_used, primitive_polygonal,
-                             primitive_processing_result.line_loop_closing_index,
-                             primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+  UpdateSystemConstantValues(
+      memexport_used, primitive_polygonal, primitive_processing_result.line_loop_closing_index,
+      primitive_processing_result.host_shader_index_endian, viewport_info, used_texture_mask,
+      normalized_depth_control, normalized_color_mask, layer_blending);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -3520,12 +3545,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       custom_texture_generation_ = UINT32_MAX;
     }
     material_shaders::AdvanceFrame();
-    // Texture packs changed: rescan, and reload every texture (at the next
-    // frame's end, with the GPU idle).
-    if (texture_replacement::ConsumeReloadRequest()) {
-      texture_replacement::Rescan();
-      cache_clear_requested_ = true;
-    }
   }
 
   return true;
@@ -3617,11 +3636,47 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
   }
 }
 
+bool D3D12CommandProcessor::EnsureMaterialLayerSums() {
+  if (material_layer_sums_) {
+    return true;
+  }
+  if (material_layer_sums_failed_ || !bindless_resources_used_) {
+    return false;
+  }
+  // The largest render target the layers may be drawn to: 1280 x 1280 guest
+  // pixels at the draw resolution scale, 2 floats each.
+  uint32_t pitch = 1280 * texture_cache_->draw_resolution_scale_x();
+  uint32_t height = 1280 * texture_cache_->draw_resolution_scale_y();
+  uint32_t size = pitch * height * uint32_t(sizeof(float) * 2);
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  D3D12_RESOURCE_DESC desc;
+  ui::d3d12::util::FillBufferResourceDesc(desc, size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&material_layer_sums_)))) {
+    REXGPU_ERROR("Could not create the material shaders' layer blending buffer ({} MB)",
+                 size >> 20);
+    material_layer_sums_failed_ = true;
+    return false;
+  }
+  material_layer_sums_->SetName(L"Material Layer Sums");
+  // Nothing has used the descriptor yet (it was null).
+  ui::d3d12::util::CreateBufferRawUAV(
+      provider.GetDevice(),
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kMaterialLayerSumsUAV)),
+      material_layer_sums_.Get(), size);
+  material_layer_sums_pitch_ = pitch;
+  material_layer_sums_height_ = height;
+  REXGPU_INFO("Material shaders' layer blending: {}x{} sums ({} MB)", pitch, height, size >> 20);
+  return true;
+}
+
 void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask, bool layer_blending) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4059,6 +4114,22 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     float material_params[material_shaders::kMaterialParamsCount][4];
     material_shaders::GetParams(material_params, draw_resolution_scale_x, draw_resolution_scale_y,
                                 translation_flags, vertex_shader_traits, vertex_shader_hash);
+    // Layer blending: whether the pipeline blends for it, whether this is the
+    // surface's first layer (the game's color blend replacing the destination
+    // - a zero factor, as the pipeline cache maps it), and the sums buffer.
+    if (layer_blending) {
+      uint32_t layer_flags = material_shaders::kLayerBlendingFlagActive;
+      uint32_t dest_blend =
+          uint32_t(regs.Get<reg::RB_BLENDCONTROL>(XE_GPU_REG_RB_BLENDCONTROL0).color_destblend);
+      if (dest_blend == 0 || dest_blend == 2 || dest_blend == 3 || dest_blend > 16) {
+        layer_flags |= material_shaders::kLayerBlendingFlagFirstLayer;
+      }
+      if (EnsureMaterialLayerSums()) {
+        material_params[2][2] = float(material_layer_sums_pitch_);
+        material_params[2][3] = float(material_layer_sums_height_);
+      }
+      material_params[3][3] = float(layer_flags);
+    }
     // The custom textures (loaded again after texture packs or the material
     // shaders reload), and the bound textures' companion maps.
     if (custom_texture_generation_ != texture_cache_->standalone_generation()) {
@@ -4071,15 +4142,60 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
             texture_cache_->GetStandaloneTextureDescriptor(custom_texture.path);
       }
     }
+    // The shaders index the bindless textures from the start of the unbounded
+    // SRV range, not of the heap - like the translator's descriptor indices.
+    auto shader_texture_index = [](uint32_t heap_index) {
+      return std::bit_cast<float>(heap_index == material_shaders::kNoTexture
+                                      ? material_shaders::kNoTexture
+                                      : heap_index -
+                                            uint32_t(SystemBindlessView::kUnboundedSRVsStart));
+    };
     for (uint32_t slot = 0; slot < material_shaders::kCustomTextureSlotCount; ++slot) {
       material_params[12 + slot / 4][slot % 4] =
-          std::bit_cast<float>(custom_texture_descriptors_[slot]);
+          shader_texture_index(custom_texture_descriptors_[slot]);
     }
+    const Shader* pixel_shader = active_pixel_shader();
     for (uint32_t fetch = 0; fetch < material_shaders::kCompanionFetchCount; ++fetch) {
-      uint32_t companions[4];
-      texture_cache_->GetCompanionDescriptors(fetch, companions);
+      // Only the fetch constants this draw samples - the others may still hold
+      // an earlier draw's textures.
+      uint32_t companions[4] = {material_shaders::kNoTexture, material_shaders::kNoTexture,
+                                material_shaders::kNoTexture, material_shaders::kNoTexture};
+      uint64_t texture_hash = 0;
+      if (used_texture_mask & (uint32_t(1) << fetch)) {
+        texture_hash = texture_cache_->GetCompanionDescriptors(fetch, companions);
+      }
       for (uint32_t kind = 0; kind < 4; ++kind) {
-        material_params[14 + fetch][kind] = std::bit_cast<float>(companions[kind]);
+        material_params[14 + fetch][kind] = shader_texture_index(companions[kind]);
+      }
+      // Which shaders draw with a texture that has maps - the ones a mod's
+      // material shader would replace to use them. Once per texture, shader
+      // and fetch constant.
+      if (texture_hash && pixel_shader) {
+        uint64_t key = texture_hash ^ (pixel_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull) ^
+                       (uint64_t(fetch) << 59);
+        if (companion_uses_logged_.insert(key).second) {
+          REXGPU_INFO(
+              "Texture {:016X} (with maps) is drawn by pixel shader {:016X} as fetch "
+              "constant {}",
+              texture_hash, pixel_shader->ucode_data_hash(), fetch);
+        }
+      }
+    }
+    // Maps only reach shaders for the first fetch constants; say so for the rest.
+    for (uint32_t fetch = material_shaders::kCompanionFetchCount; fetch < 32; ++fetch) {
+      if (!(used_texture_mask & (uint32_t(1) << fetch)) || !pixel_shader) {
+        continue;
+      }
+      uint32_t companions[4];
+      uint64_t texture_hash = texture_cache_->GetCompanionDescriptors(fetch, companions);
+      uint64_t key = texture_hash ^ (pixel_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull) ^
+                     (uint64_t(fetch) << 59);
+      if (texture_hash && companion_uses_logged_.insert(key).second) {
+        REXGPU_WARN(
+            "Texture {:016X} (with maps) is drawn by pixel shader {:016X} as fetch "
+            "constant {}, but only fetch constants 0-{} get their maps",
+            texture_hash, pixel_shader->ucode_data_hash(), fetch,
+            material_shaders::kCompanionFetchCount - 1);
       }
     }
     static_assert(sizeof(material_params) == sizeof(system_constants_.material_params));

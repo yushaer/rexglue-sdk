@@ -43,11 +43,11 @@ namespace rex::graphics::material_shaders {
 // 2.x - Traits of the draw's vertex shader (uint bits, VertexShaderTrait) - to
 //       tell characters (skinned) from props with the same pixel shader.
 // 2.y - The draw's vertex shader hash, low 32 bits (uint).
-// 2.zw - Reserved.
+// 2.z, 2.w - Layer blending: the sums buffer's width and height in pixels.
 // 3.x, 3.y - Draw resolution scale.
 // 3.z - Translation flags (uint bits, TranslationFlag) - what the translator
 //       bakes into its shaders.
-// 3.w - Reserved.
+// 3.w - Layer blending flags (LayerBlendingFlag, as a float).
 // 4-11 - The shader options: 32 floats, slot i in [4 + i / 4][i % 4], declared
 //        in options.toml (see LoadOptions) and set in the menu.
 // 12-13 - The custom textures (textures.toml): slot i's bindless descriptor
@@ -56,6 +56,30 @@ namespace rex::graphics::material_shaders {
 //         = the descriptor indices (uint) of its CompanionMap kinds, or
 //         kNoTexture.
 constexpr uint32_t kMaterialParamsCount = 22;
+
+// Layer blending - for surfaces the game draws as layers, one pass each, added
+// up weighted by their alphas (the first pass replacing what's there): a
+// material shader declaring the sums buffer (XE_LAYER_BLENDING in
+// xenos_d3d12.hlsli - register u0 in kLayerSumsRegisterSpace) can weight its
+// layer by a factor of its own (a height map) and have the layers normalized
+// together, though each pass only knows its own layer. The buffer keeps, per
+// pixel, the sums of the alphas and of the weighted alphas of the layers
+// drawn so far (rasterizer ordered); the pass blends its color as
+// color + destination * second color's alpha (dual-source) and rescales the
+// earlier layers' sum with that. Needs rasterizer ordered views, a single
+// render target and the host render target path; without them the shader
+// isn't used.
+constexpr uint32_t kLayerSumsRegisterSpace = 20;
+enum LayerBlendingFlag : uint32_t {
+  // The pass replaces the destination (the game's color blend has a zero
+  // destination factor): the surface's first layer.
+  kLayerBlendingFlagFirstLayer = 1u << 0,
+  // The blending above is set up for this draw (else the game's blending is).
+  kLayerBlendingFlagActive = 1u << 1,
+};
+// The name the sums buffer's declaration leaves in a shader's binary.
+constexpr char kLayerSumsName[] = "xe_layer_sums";
+
 constexpr uint32_t kOptionSlotCount = 32;
 constexpr uint32_t kCustomTextureSlotCount = 8;
 constexpr uint32_t kCompanionFetchCount = 8;

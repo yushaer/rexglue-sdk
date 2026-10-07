@@ -381,6 +381,7 @@ void GetParams(float params_out[kMaterialParamsCount][4], uint32_t draw_resoluti
   params_out[1][3] = float(REXCVAR_GET(material_fire_intensity));
   params_out[2][0] = std::bit_cast<float>(vertex_shader_traits);
   params_out[2][1] = std::bit_cast<float>(uint32_t(vertex_shader_hash));
+  // Layer blending (2.zw, 3.w) is the backend's.
   params_out[2][2] = 0.0f;
   params_out[2][3] = 0.0f;
   params_out[3][0] = float(draw_resolution_scale_x);
