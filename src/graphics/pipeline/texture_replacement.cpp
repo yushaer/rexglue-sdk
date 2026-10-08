@@ -94,30 +94,43 @@ std::filesystem::path Utf8Path(std::string_view text) {
   return std::filesystem::u8path(text.begin(), text.end());
 }
 
-std::optional<uint64_t> ParseHashName(const std::filesystem::path& path) {
+// The texture hashes a file name starts with: one, or several joined by + (an
+// image standing in for several textures - like the same picture at the sizes
+// the game streams it at), then notes after a separator if any. None if the
+// name isn't like that.
+std::vector<uint64_t> ParseHashNames(const std::filesystem::path& path) {
   std::string stem = path.stem().u8string();
-  if (stem.size() < 16) {
-    return std::nullopt;
-  }
-  uint64_t hash = 0;
-  for (size_t i = 0; i < 16; ++i) {
-    char c = char(std::toupper(uint8_t(stem[i])));
-    uint32_t digit;
-    if (c >= '0' && c <= '9') {
-      digit = uint32_t(c - '0');
-    } else if (c >= 'A' && c <= 'F') {
-      digit = uint32_t(c - 'A' + 10);
-    } else {
-      return std::nullopt;
+  std::vector<uint64_t> hashes;
+  size_t position = 0;
+  while (true) {
+    if (stem.size() < position + 16) {
+      return {};
     }
-    hash = (hash << 4) | digit;
+    uint64_t hash = 0;
+    for (size_t i = position; i < position + 16; ++i) {
+      char c = char(std::toupper(uint8_t(stem[i])));
+      uint32_t digit;
+      if (c >= '0' && c <= '9') {
+        digit = uint32_t(c - '0');
+      } else if (c >= 'A' && c <= 'F') {
+        digit = uint32_t(c - 'A' + 10);
+      } else {
+        return {};
+      }
+      hash = (hash << 4) | digit;
+    }
+    hashes.push_back(hash);
+    position += 16;
+    if (position >= stem.size() || stem[position] != '+') {
+      break;
+    }
+    ++position;
   }
-  // Notes may follow after a separator.
-  if (stem.size() > 16 && stem[16] != '_' && stem[16] != '-' && stem[16] != ' ' &&
-      stem[16] != '.') {
-    return std::nullopt;
+  if (position < stem.size() && stem[position] != '_' && stem[position] != '-' &&
+      stem[position] != ' ' && stem[position] != '.') {
+    return {};
   }
-  return hash;
+  return hashes;
 }
 
 bool IsImageExtension(std::string extension) {
@@ -404,18 +417,16 @@ void Rescan() {
       if (!entry.is_regular_file(error) || !IsImageExtension(entry.path().extension().u8string())) {
         continue;
       }
-      std::optional<uint64_t> hash = ParseHashName(entry.path());
-      if (!hash) {
-        continue;
-      }
       // Earlier (higher priority) folders win.
       std::optional<uint32_t> companion_kind = ParseCompanionKind(entry.path());
-      if (companion_kind) {
-        if (found_companions[*companion_kind].emplace(*hash, entry.path()).second) {
+      for (uint64_t hash : ParseHashNames(entry.path())) {
+        if (companion_kind) {
+          if (found_companions[*companion_kind].emplace(hash, entry.path()).second) {
+            ++count;
+          }
+        } else if (found.emplace(hash, entry.path()).second) {
           ++count;
         }
-      } else if (found.emplace(*hash, entry.path()).second) {
-        ++count;
       }
     }
     if (count) {
