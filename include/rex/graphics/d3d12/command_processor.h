@@ -230,8 +230,14 @@ class D3D12CommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
 
+  void FrameLogTimestamp(uint32_t index) override;
+  bool FrameLogReadTimestamps(uint32_t pass_count, uint32_t marker_count,
+                              std::vector<double>& ms_out) override;
+
  private:
   static constexpr uint32_t kQueueFrames = 3;
+  // gpu_frame_log's GPU timestamps (passes of one frame, plus the swap).
+  static constexpr uint32_t kFrameLogTimestampCount = 4096;
 
   enum RootParameter : UINT {
     // Keep the size of the root signature at each stage 13 dwords or less
@@ -385,12 +391,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Returns a buffer for reading GPU data back to the CPU. Assuming
   // synchronizing immediately after use. Always in COPY_DEST state.
   ID3D12Resource* RequestReadbackBuffer(uint32_t size);
+  // Resolve readback alternates between slots 0 and 1; memexport readback goes
+  // around all of them (one more than the frames that can be in flight, so the
+  // CPU always has a finished one to read without waiting for the GPU).
+  static constexpr uint32_t kReadbackSlots = kQueueFrames + 1;
   struct ReadbackBuffer {
-    ID3D12Resource* buffers[2] = {nullptr, nullptr};
-    uint32_t sizes[2] = {0, 0};
-    void* mapped_data[2] = {nullptr, nullptr};
-    uint64_t submission_written[2] = {0, 0};
-    uint32_t written_size[2] = {0, 0};
+    ID3D12Resource* buffers[kReadbackSlots] = {};
+    uint32_t sizes[kReadbackSlots] = {};
+    void* mapped_data[kReadbackSlots] = {};
+    uint64_t submission_written[kReadbackSlots] = {};
+    uint32_t written_size[kReadbackSlots] = {};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
   };
@@ -667,6 +677,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t material_layer_sums_pitch_ = 0;
   uint32_t material_layer_sums_height_ = 0;
   bool material_layer_sums_failed_ = false;
+  // gpu_frame_log's timestamps, created on first use.
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> frame_log_timestamps_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_log_timestamp_readback_;
+  // What CheckSubmissionFence is waiting for the GPU for (gpu_frame_log).
+  const char* gpu_wait_reason_ = nullptr;
+  // Frames since the video memory budget was last checked.
+  uint32_t video_memory_check_frame_ = 0;
 
   static constexpr uint32_t kScratchBufferSizeIncrement = 16 * 1024 * 1024;
   ID3D12Resource* scratch_buffer_ = nullptr;

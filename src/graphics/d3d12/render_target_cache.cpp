@@ -222,6 +222,7 @@ bool D3D12RenderTargetCache::Initialize() {
     return false;
   }
   edram_buffer_->SetName(L"EDRAM Buffer");
+  provider.SetResidencyPriority(edram_buffer_, D3D12_RESIDENCY_PRIORITY_HIGH);
   edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
 
   // Create non-shader-visible descriptors of the EDRAM buffer for copying.
@@ -1067,8 +1068,60 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
+      const std::vector<Transfer>* transfers = last_update_transfers();
+      bool any_transfers = false;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        any_transfers |= !transfers[i].empty();
+      }
+      if (any_transfers) {
+        command_processor_.FrameLogMarker("render target transfers");
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          for (const Transfer& transfer : transfers[i]) {
+            command_processor_.FrameLogNote(fmt::format(
+                "transfer to {} from {}: tiles {}-{} ({})",
+                depth_and_color_render_targets[i]
+                    ? depth_and_color_render_targets[i]->key().GetDebugName()
+                    : "?",
+                transfer.source ? transfer.source->key().GetDebugName() : "?", transfer.start_tiles,
+                transfer.end_tiles, transfer.end_tiles - transfer.start_tiles));
+          }
+        }
+      }
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+                                       depth_and_color_render_targets, transfers);
+      if (any_transfers) {
+        command_processor_.FrameLogMarker("(after the transfers)");
+      }
+      // The stencil bits the draw may set.
+      if (normalized_depth_control.stencil_enable && depth_and_color_render_targets[0]) {
+        const RegisterFile& regs = register_file();
+        uint32_t bits = 0;
+        auto add_op = [&bits](xenos::StencilOp op, uint32_t ref, uint32_t write_mask) {
+          switch (op) {
+            case xenos::StencilOp::kKeep:
+            case xenos::StencilOp::kZero:
+              break;
+            case xenos::StencilOp::kReplace:
+              bits |= ref & write_mask;
+              break;
+            default:
+              bits |= write_mask;
+              break;
+          }
+        };
+        auto front = regs.Get<reg::RB_STENCILREFMASK>();
+        add_op(normalized_depth_control.stencilfail, front.stencilref, front.stencilwritemask);
+        add_op(normalized_depth_control.stencilzfail, front.stencilref, front.stencilwritemask);
+        add_op(normalized_depth_control.stencilzpass, front.stencilref, front.stencilwritemask);
+        if (normalized_depth_control.backface_enable) {
+          auto back = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
+          add_op(normalized_depth_control.stencilfail_bf, back.stencilref, back.stencilwritemask);
+          add_op(normalized_depth_control.stencilzfail_bf, back.stencilref, back.stencilwritemask);
+          add_op(normalized_depth_control.stencilzpass_bf, back.stencilref, back.stencilwritemask);
+        }
+        static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0])
+            ->AddStencilBitsMaybeSet(bits);
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {
@@ -1197,6 +1250,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
+          command_processor_.FrameLogMarker("resolve: direct copy");
           direct_resolved =
               TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
           if (direct_resolved) {
@@ -1213,6 +1267,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           uint32_t dump_rows;
           uint32_t dump_pitch;
           resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          command_processor_.FrameLogMarker("resolve: dump render targets to eDRAM");
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
@@ -1287,6 +1342,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
           // Submit the resolve.
+          command_processor_.FrameLogMarker("resolve: copy shader");
           command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
@@ -1331,6 +1387,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
   if (clear_depth || clear_color) {
+    command_processor_.FrameLogMarker("resolve: clear");
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
@@ -1414,6 +1471,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     cleared = true;
   }
 
+  command_processor_.FrameLogMarker("(after the resolve)");
   return copied && cleared;
 }
 
@@ -1614,6 +1672,10 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
     std::u16string resource_name = rex::string::to_utf16(key.GetDebugName());
     resource->SetName(reinterpret_cast<LPCWSTR>(resource_name.c_str()));
   }
+  // Drawn to and copied between every frame - the last thing Windows should
+  // move to system memory when video memory runs short.
+  command_processor_.GetD3D12Provider().SetResidencyPriority(resource.Get(),
+                                                             D3D12_RESIDENCY_PRIORITY_HIGH);
 
   ui::d3d12::D3D12CpuDescriptorPool& descriptor_pool =
       key.is_depth ? *descriptor_pool_depth_ : *descriptor_pool_color_;
@@ -4101,6 +4163,16 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
     RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
 
+    // The stencil the transfers bring in: a depth source's bits, any from color.
+    if (dest_rt_key.is_depth) {
+      for (const Transfer& transfer : current_transfers) {
+        dest_d3d12_rt.AddStencilBitsMaybeSet(
+            transfer.source && transfer.source->key().is_depth
+                ? static_cast<const D3D12RenderTarget*>(transfer.source)->stencil_bits_maybe_set()
+                : 0xFF);
+      }
+    }
+
     // Late barrier in case there was cross-copying that prevented merging of
     // barriers.
     D3D12_RESOURCE_STATES dest_state = dest_rt_key.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE
@@ -4536,8 +4608,33 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
 
         // Draw the transfer rectangles.
+        {
+          static const char* const kTransferModeMarkers[] = {
+              "transfer: color to depth",
+              "transfer: color to color",
+              "transfer: depth to depth",
+              "transfer: depth to color",
+              "transfer: color to stencil bits",
+              "transfer: depth to stencil bits",
+              "transfer: color + host depth to depth",
+              "transfer: depth + host depth to depth",
+          };
+          command_processor_.FrameLogMarker(kTransferModeMarkers[size_t(transfer_shader_key.mode)]);
+        }
+        // Stencil bits that can't be set in a depth source are already 0 - the
+        // destination's stencil has been cleared for the transfer.
+        uint32_t stencil_bits = 0xFF;
+        if (is_stencil_bit && source_d3d12_rt.key().is_depth) {
+          stencil_bits = source_d3d12_rt.stencil_bits_maybe_set();
+          command_processor_.FrameLogNote(
+              fmt::format("stencil bits {:02X} from {}: {} of 8 passes", stencil_bits,
+                          source_d3d12_rt.key().GetDebugName(), rex::bit_count(stencil_bits)));
+        }
         command_processor_.SubmitBarriers();
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
+          if (is_stencil_bit && !(stencil_bits & (uint32_t(1) << j))) {
+            continue;
+          }
           if (is_stencil_bit) {
             uint32_t transfer_stencil_bit = uint32_t(1) << j;
             command_list.D3DSetGraphicsRoot32BitConstants(
@@ -4566,6 +4663,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             depth_host_clear_value = xenos::Float20e4To32(depth_guest_clear_value) * 0.5f;
             break;
         }
+        dest_d3d12_rt.AddStencilBitsMaybeSet(uint32_t(clear_value));
         command_processor_.PushTransitionBarrier(
             dest_d3d12_rt.resource(),
             dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),

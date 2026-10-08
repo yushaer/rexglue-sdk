@@ -81,6 +81,17 @@ class D3D12Provider : public GraphicsProvider {
   // Adapter info.
   GpuVendorID GetAdapterVendorID() const { return adapter_vendor_id_; }
 
+  // Video memory: the process's budget and usage in the adapter's own memory
+  // (false if the OS can't tell).
+  bool QueryLocalVideoMemory(DXGI_QUERY_VIDEO_MEMORY_INFO& info_out) const;
+  // Reserves as much video memory as d3d12_video_memory_reservation_mb asks
+  // and Windows allows now (it allows more as other programs give memory up).
+  // Returns the reservation in bytes.
+  uint64_t UpdateVideoMemoryReservation() const;
+  // Which resources the OS should keep in video memory when it runs short -
+  // high for what's used every frame (render targets), so textures go first.
+  void SetResidencyPriority(ID3D12Pageable* object, D3D12_RESIDENCY_PRIORITY priority) const;
+
   // Device features.
   D3D12_HEAP_FLAGS GetHeapFlagCreateNotZeroed() const { return heap_flag_create_not_zeroed_; }
   D3D12_PROGRAMMABLE_SAMPLE_POSITIONS_TIER
@@ -151,7 +162,11 @@ class D3D12Provider : public GraphicsProvider {
   DxcCreateInstanceProc pfn_dxcompiler_dxc_create_instance_ = nullptr;
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
+  // For the video memory budget and reservation, if available.
+  IDXGIAdapter3* adapter3_ = nullptr;
   ID3D12Device* device_ = nullptr;
+  // For residency priorities, if available.
+  ID3D12Device1* device1_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;
 

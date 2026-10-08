@@ -80,6 +80,33 @@ const ShaderCode kComputeShaders[] = {
     REX_SCENE_FX_SHADER(scene_fx_temporal_cs),
 };
 #undef REX_SCENE_FX_SHADER
+// For gpu_frame_log's markers, in the same order.
+const char* const kComputeShaderNames[] = {
+    "scene fx: depth copy",
+    "scene fx: depth copy (MSAA)",
+    "scene fx: shadow copy",
+    "scene fx: AO prefilter",
+    "scene fx: AO",
+    "scene fx: AO + GI",
+    "scene fx: blur",
+    "scene fx: blur RGBA",
+    "scene fx: sky color",
+    "scene fx: sky color (MSAA)",
+    "scene fx: color capture",
+    "scene fx: color capture (MSAA)",
+    "scene fx: color copy",
+    "scene fx: color copy (MSAA)",
+    "scene fx: contact shadows",
+    "scene fx: reflections",
+    "scene fx: volumetrics",
+    "scene fx: temporal",
+};
+const char* const kDrawNames[] = {
+    "scene fx: composite (multiply)",
+    "scene fx: composite (add)",
+    "scene fx: composite (debug)",
+    "scene fx: image",
+};
 
 // Read by both compute and pixel shaders without transitions in between.
 constexpr D3D12_RESOURCE_STATES kShaderReadState =
@@ -352,6 +379,7 @@ bool D3D12SceneEffects::Dispatch(Pipeline pipeline, std::initializer_list<Source
                                  std::initializer_list<Target> targets, const void* constants,
                                  const void* extra_constants, size_t extra_constants_size,
                                  uint32_t width, uint32_t height) {
+  command_processor_.FrameLogMarker(kComputeShaderNames[size_t(pipeline)]);
   uint32_t source_count = uint32_t(sources.size());
   uint32_t target_count = uint32_t(targets.size());
   assert_true(source_count && source_count <= kMaxSources);
@@ -405,6 +433,8 @@ bool D3D12SceneEffects::Dispatch(Pipeline pipeline, std::initializer_list<Source
   command_processor_.SetExternalPipeline(pipelines_[size_t(pipeline)]);
   command_processor_.SubmitBarriers();
   command_list.D3DDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  // What follows until the next marker or pass isn't this effect's.
+  command_processor_.FrameLogMarker("(after the scene fx)");
   return true;
 }
 
@@ -412,6 +442,7 @@ bool D3D12SceneEffects::DrawFullscreen(Draw draw, RenderTarget& render_target, c
                                        std::initializer_list<Source> sources,
                                        const void* constants, const void* extra_constants,
                                        size_t extra_constants_size) {
+  command_processor_.FrameLogMarker(kDrawNames[size_t(draw)]);
   auto& d3d12_rt = static_cast<D3D12RenderTargetCache::D3D12RenderTarget&>(render_target);
   DXGI_FORMAT format =
       d3d12_render_target_cache_.GetColorDrawDXGIFormat(d3d12_rt.key().GetColorFormat());
@@ -463,6 +494,7 @@ bool D3D12SceneEffects::DrawFullscreen(Draw draw, RenderTarget& render_target, c
   D3D12_RECT scissor = {rect.left, rect.top, rect.right, rect.bottom};
   command_processor_.SetScissorRect(scissor);
   command_list.D3DDrawInstanced(3, 1, 0, 0);
+  command_processor_.FrameLogMarker("(after the scene fx)");
   return true;
 }
 

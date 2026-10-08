@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -1662,7 +1663,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
     auto& readback = resolve_readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
@@ -1679,7 +1680,7 @@ void D3D12CommandProcessor::ShutdownContext() {
   readback_buffers_.clear();
   for (auto& memexport_readback_pair : memexport_readback_buffers_) {
     auto& readback = memexport_readback_pair.second;
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
@@ -1924,6 +1925,24 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+
+  // Over the video memory budget, Windows moves some of the game's memory to
+  // system memory, and the GPU slows down many times - say so (every few
+  // seconds at most).
+  if (++video_memory_check_frame_ >= 300) {
+    video_memory_check_frame_ = 0;
+    // Take more of the video memory as Windows makes more available.
+    GetD3D12Provider().UpdateVideoMemoryReservation();
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory_info;
+    if (GetD3D12Provider().QueryLocalVideoMemory(memory_info) &&
+        memory_info.CurrentUsage > memory_info.Budget) {
+      REXGPU_WARN(
+          "Video memory over budget: the game uses {} MB, Windows gives it {} MB - the rest is "
+          "in system memory, which makes the GPU much slower (close other programs using the GPU, "
+          "or lower the resolution scale or texture packs)",
+          memory_info.CurrentUsage >> 20, memory_info.Budget >> 20);
+    }
+  }
 
   if (!graphics_system_)
     return;
@@ -2791,7 +2810,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
-  if (!AwaitAllQueueOperationsCompletion()) {
+  gpu_wait_reason_ = "memexport readback";
+  bool awaited = AwaitAllQueueOperationsCompletion();
+  gpu_wait_reason_ = nullptr;
+  if (!awaited) {
     return true;
   }
 
@@ -2868,8 +2890,10 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     return true;
   };
 
-  const uint32_t write_index = readback.current_index;
-  const uint32_t read_index = 1 - write_index;
+  // Copied into the slots in turn; the newest one the GPU has finished goes to
+  // guest memory - a frame or few old when the GPU is behind, but never a wait
+  // for it (that would make the CPU and the GPU take turns every frame).
+  const uint32_t write_index = readback.current_index % kReadbackSlots;
   const uint32_t readback_size = AlignReadbackBufferSize(total_size);
   if (!ensure_readback_slot(write_index, readback_size)) {
     return IssueDraw_MemexportReadbackFullPath(total_size);
@@ -2888,15 +2912,31 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   readback.submission_written[write_index] = submission_current_;
   readback.written_size[write_index] = total_size;
 
+  readback.current_index = (write_index + 1) % kReadbackSlots;
+
   CheckSubmissionFence(0);
-  bool previous_slot_ready = readback.buffers[read_index] && readback.mapped_data[read_index] &&
-                             total_size <= readback.sizes[read_index] &&
-                             total_size <= readback.written_size[read_index] &&
-                             readback.submission_written[read_index] &&
-                             readback.submission_written[read_index] <= submission_completed_;
-  if (!previous_slot_ready) {
-    IssueDraw_MemexportReadbackFullPath(total_size);
-    readback.current_index = read_index;
+  uint32_t read_index = UINT32_MAX;
+  for (uint32_t i = 0; i < kReadbackSlots; ++i) {
+    if (i == write_index || !readback.buffers[i] || !readback.mapped_data[i] ||
+        total_size > readback.sizes[i] || total_size > readback.written_size[i] ||
+        !readback.submission_written[i] || readback.submission_written[i] > submission_completed_) {
+      continue;
+    }
+    if (read_index == UINT32_MAX ||
+        readback.submission_written[i] > readback.submission_written[read_index]) {
+      read_index = i;
+    }
+  }
+  if (read_index == UINT32_MAX) {
+    bool any_in_flight = false;
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
+      any_in_flight |= i != write_index && readback.submission_written[i] != 0;
+    }
+    if (!any_in_flight) {
+      // The first time: wait this once.
+      IssueDraw_MemexportReadbackFullPath(total_size);
+    }
+    // Otherwise guest memory keeps what was read last.
     return true;
   }
 
@@ -2906,7 +2946,6 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
   }
-  readback.current_index = read_index;
   return true;
 }
 
@@ -3115,12 +3154,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  bool use_delayed_sync =
-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  // With readback off, only forced addresses get here.
+  bool use_delayed_sync = readback_mode == ReadbackResolveMode::kFast ||
+                          readback_mode == ReadbackResolveMode::kSome ||
+                          (readback_mode == ReadbackResolveMode::kDisabled &&
+                           REXCVAR_GET(readback_resolve_force_delayed));
   uint32_t read_index = write_index;
+  gpu_wait_reason_ = "resolve readback";
   if (use_delayed_sync) {
     read_index = 1 - write_index;
   } else if (!AwaitAllQueueOperationsCompletion()) {
+    gpu_wait_reason_ = nullptr;
     return true;
   }
 
@@ -3130,9 +3174,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     is_cache_miss = true;
     read_index = write_index;
     if (!AwaitAllQueueOperationsCompletion()) {
+      gpu_wait_reason_ = nullptr;
       return true;
     }
   }
+  gpu_wait_reason_ = nullptr;
 
   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
@@ -3148,6 +3194,23 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 }
 
 void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+  // gpu_frame_log notes each wait for the GPU, with what it was for.
+  auto wait_start = std::chrono::steady_clock::now();
+  bool waited = false;
+  struct WaitNote {
+    D3D12CommandProcessor& processor;
+    const std::chrono::steady_clock::time_point& start;
+    const bool& waited;
+    ~WaitNote() {
+      if (waited) {
+        processor.FrameLogNote(fmt::format(
+            "waited {:.2f} ms for the GPU ({})",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count(),
+            processor.gpu_wait_reason_ ? processor.gpu_wait_reason_ : "other"));
+      }
+    }
+  } wait_note{*this, wait_start, waited};
   if (await_submission >= submission_current_) {
     if (submission_open_) {
       EndSubmission(false);
@@ -3164,6 +3227,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
         WaitForSingleObject(fence_completion_event_, INFINITE);
+        waited = true;
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3183,6 +3247,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      waited = true;
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3322,8 +3387,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
+  gpu_wait_reason_ = "frame latency";
   CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
                                         : 0);
+  gpu_wait_reason_ = nullptr;
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -3634,6 +3701,86 @@ void D3D12CommandProcessor::UpdateFixedFunctionState(
       ff_stencil_ref_update_needed_ = false;
     }
   }
+}
+
+void D3D12CommandProcessor::FrameLogTimestamp(uint32_t index) {
+  if (index >= kFrameLogTimestampCount) {
+    return;
+  }
+  if (!frame_log_timestamps_) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    D3D12_QUERY_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap_desc.Count = kFrameLogTimestampCount;
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kFrameLogTimestampCount,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&frame_log_timestamps_))) ||
+        FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+                                               provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&frame_log_timestamp_readback_)))) {
+      REXGPU_WARN("gpu_frame_log: could not create the GPU timestamp queries");
+      frame_log_timestamps_.Reset();
+      frame_log_timestamp_readback_.Reset();
+      return;
+    }
+  }
+  if (BeginSubmission(true)) {
+    deferred_command_list_.D3DEndQuery(frame_log_timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                       index);
+  }
+}
+
+bool D3D12CommandProcessor::FrameLogReadTimestamps(uint32_t pass_count, uint32_t marker_count,
+                                                   std::vector<double>& ms_out) {
+  if (!frame_log_timestamps_ || pass_count < 2 || pass_count > kFrameLogMarkerBase ||
+      marker_count > kFrameLogMarkerCount || !BeginSubmission(false)) {
+    return false;
+  }
+  // Only the written ones.
+  deferred_command_list_.D3DResolveQueryData(frame_log_timestamps_.Get(),
+                                             D3D12_QUERY_TYPE_TIMESTAMP, 0, pass_count,
+                                             frame_log_timestamp_readback_.Get(), 0);
+  if (marker_count) {
+    deferred_command_list_.D3DResolveQueryData(
+        frame_log_timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kFrameLogMarkerBase, marker_count,
+        frame_log_timestamp_readback_.Get(), sizeof(uint64_t) * kFrameLogMarkerBase);
+  }
+  if (!EndSubmission(false) || !AwaitAllQueueOperationsCompletion()) {
+    return false;
+  }
+  UINT64 frequency = 0;
+  if (FAILED(GetD3D12Provider().GetDirectQueue()->GetTimestampFrequency(&frequency)) ||
+      !frequency) {
+    return false;
+  }
+  D3D12_RANGE read_range = {0, sizeof(uint64_t) * (kFrameLogMarkerBase + marker_count)};
+  void* mapping = nullptr;
+  if (FAILED(frame_log_timestamp_readback_->Map(0, &read_range, &mapping))) {
+    return false;
+  }
+  const uint64_t* timestamps = static_cast<const uint64_t*>(mapping);
+  auto to_ms = [&](uint64_t timestamp) {
+    return double(int64_t(timestamp - timestamps[0])) * 1000.0 / double(frequency);
+  };
+  ms_out.resize(pass_count + marker_count);
+  for (uint32_t i = 0; i < pass_count; ++i) {
+    ms_out[i] = to_ms(timestamps[i]);
+  }
+  for (uint32_t i = 0; i < marker_count; ++i) {
+    ms_out[pass_count + i] = to_ms(timestamps[kFrameLogMarkerBase + i]);
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO memory_info;
+  if (GetD3D12Provider().QueryLocalVideoMemory(memory_info)) {
+    FrameLogNote(fmt::format("video memory: {} MB used of a {} MB budget ({} MB reserved)",
+                             memory_info.CurrentUsage >> 20, memory_info.Budget >> 20,
+                             memory_info.CurrentReservation >> 20));
+  }
+  D3D12_RANGE written_range = {0, 0};
+  frame_log_timestamp_readback_->Unmap(0, &written_range);
+  return true;
 }
 
 bool D3D12CommandProcessor::EnsureMaterialLayerSums() {
@@ -4963,7 +5110,7 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
       ++it;
       continue;
     }
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < kReadbackSlots; ++i) {
       if (readback.buffers[i]) {
         if (readback.mapped_data[i]) {
           readback.buffers[i]->Unmap(0, nullptr);
@@ -5148,7 +5295,9 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   }
 
   uint64_t query_submission = submission_current_ ? submission_current_ - 1 : 0;
+  gpu_wait_reason_ = "occlusion query";
   CheckSubmissionFence(query_submission);
+  gpu_wait_reason_ = nullptr;
   if (submission_completed_ < query_submission) {
     return false;
   }

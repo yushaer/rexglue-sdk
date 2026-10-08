@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cstdlib>
 
 #include <rex/cvar.h>
@@ -37,7 +38,45 @@ REXCVAR_DEFINE_INT32(d3d12_queue_priority, 1, "UI/D3D12",
                      "Graphics command queue priority (0=normal, 1=high, 2=realtime)")
     .range(0, 2);
 
+REXCVAR_DEFINE_INT32(d3d12_video_memory_reservation_mb, -1, "UI/D3D12",
+                     "Video memory to reserve for the game, in MB, so Windows keeps it in video "
+                     "memory ahead of other programs' (-1 = as much as Windows allows, 0 = none)")
+    .range(-1, 1 << 20)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex::ui::d3d12 {
+
+bool D3D12Provider::QueryLocalVideoMemory(DXGI_QUERY_VIDEO_MEMORY_INFO& info_out) const {
+  return adapter3_ &&
+         SUCCEEDED(adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info_out));
+}
+
+uint64_t D3D12Provider::UpdateVideoMemoryReservation() const {
+  DXGI_QUERY_VIDEO_MEMORY_INFO memory_info;
+  if (!QueryLocalVideoMemory(memory_info)) {
+    return 0;
+  }
+  int32_t reservation_mb = REXCVAR_GET(d3d12_video_memory_reservation_mb);
+  if (!reservation_mb) {
+    return memory_info.CurrentReservation;
+  }
+  UINT64 reservation = reservation_mb < 0 ? memory_info.AvailableForReservation
+                                          : std::min(UINT64(reservation_mb) << 20,
+                                                     memory_info.AvailableForReservation);
+  if (reservation > memory_info.CurrentReservation &&
+      SUCCEEDED(
+          adapter3_->SetVideoMemoryReservation(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, reservation))) {
+    return reservation;
+  }
+  return memory_info.CurrentReservation;
+}
+
+void D3D12Provider::SetResidencyPriority(ID3D12Pageable* object,
+                                         D3D12_RESIDENCY_PRIORITY priority) const {
+  if (device1_ && object) {
+    device1_->SetResidencyPriority(1, &object, &priority);
+  }
+}
 
 bool D3D12Provider::IsD3D12APIAvailable() {
   HMODULE library_d3d12 = LoadLibraryW(L"D3D12.dll");
@@ -71,8 +110,14 @@ D3D12Provider::~D3D12Provider() {
   if (direct_queue_ != nullptr) {
     direct_queue_->Release();
   }
+  if (device1_ != nullptr) {
+    device1_->Release();
+  }
   if (device_ != nullptr) {
     device_->Release();
+  }
+  if (adapter3_ != nullptr) {
+    adapter3_->Release();
   }
   if (dxgi_factory_ != nullptr) {
     dxgi_factory_->Release();
@@ -311,6 +356,24 @@ bool D3D12Provider::Initialize() {
     dxgi_factory->Release();
     return false;
   }
+  // Video memory: the budget Windows gives this process, and a reservation of
+  // it - so that under pressure Windows moves other programs' memory out of
+  // video memory rather than the game's (render targets paged out to system
+  // memory make the GPU many times slower).
+  if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&adapter3_)))) {
+    adapter3_ = nullptr;
+  }
+  if (adapter3_) {
+    uint64_t reservation = UpdateVideoMemoryReservation();
+    DXGI_QUERY_VIDEO_MEMORY_INFO memory_info;
+    if (QueryLocalVideoMemory(memory_info)) {
+      REXGPU_INFO(
+          "Video memory: budget {} MB of {} MB on the adapter, {} MB reserved for the game "
+          "(Windows allows up to {} MB now)",
+          memory_info.Budget >> 20, adapter_desc.DedicatedVideoMemory >> 20, reservation >> 20,
+          memory_info.AvailableForReservation >> 20);
+    }
+  }
   adapter->Release();
 
   // Configure the Direct3D 12 debug info queue.
@@ -395,6 +458,9 @@ bool D3D12Provider::Initialize() {
 
   dxgi_factory_ = dxgi_factory;
   device_ = device;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device1_)))) {
+    device1_ = nullptr;
+  }
   direct_queue_ = direct_queue;
 
   // Get descriptor sizes for each type.

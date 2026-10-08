@@ -28,6 +28,7 @@ REXCVAR_DECLARE(bool, draw_resolution_scaled_texture_offsets);
 REXCVAR_DECLARE(std::string, readback_resolve);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(std::string, readback_resolve_force_addresses);
+REXCVAR_DECLARE(bool, readback_resolve_force_delayed);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
 REXCVAR_DECLARE(bool, occlusion_query_enable);

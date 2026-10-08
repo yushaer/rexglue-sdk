@@ -83,6 +83,12 @@ REXCVAR_DEFINE_STRING(readback_resolve_force_addresses, "", "GPU",
                       "unofficial Xenia femtofork for Fable II).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(readback_resolve_force_delayed, true, "GPU",
+                    "Read the resolves in readback_resolve_force_addresses back a frame late, "
+                    "instead of making the CPU wait for the GPU to finish all its work every frame "
+                    "(which, with the GPU busy, costs much of the frame)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
                     "Enable CPU readback of shader memexport writes for guest memory "
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
@@ -129,12 +135,19 @@ struct FrameLogPass {
   std::map<std::pair<uint64_t, uint64_t>, uint32_t> shaders;  // (vs, ps) -> draws
   std::vector<std::string> constant_dumps;  // gpu_frame_log_constants
   std::set<uint64_t> constants_dumped;      // their pixel shaders
+  std::vector<std::string> notes;           // FrameLogNote: waits for the GPU and such
+};
+
+struct FrameLogMarker {
+  uint32_t pass;
+  const char* name;
 };
 
 struct FrameLog {
   bool recording = false;
   std::string path;
   std::vector<FrameLogPass> passes;
+  std::vector<FrameLogMarker> markers;
 };
 
 FrameLog& GetFrameLog() {
@@ -167,10 +180,21 @@ std::string DescribeRenderTargets(const RegisterFile& regs) {
   auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
   if (depth_control.z_enable || depth_control.stencil_enable) {
     auto depth = regs.Get<reg::RB_DEPTH_INFO>();
-    text += fmt::format(" depth={}@{}{}",
+    std::string stencil;
+    if (depth_control.stencil_enable) {
+      // Function, then the fail / depth fail / pass operations, the reference
+      // and the write mask (Xenos CompareFunction / StencilOp numbers).
+      auto ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+      stencil =
+          fmt::format("+stencil(f{} o{}{}{} r{:02X} w{:02X})", uint32_t(depth_control.stencilfunc),
+                      uint32_t(depth_control.stencilfail), uint32_t(depth_control.stencilzfail),
+                      uint32_t(depth_control.stencilzpass), uint32_t(ref_mask.stencilref),
+                      uint32_t(ref_mask.stencilwritemask));
+    }
+    text += fmt::format(" depth={}@{}{}{}",
                         depth.depth_format == DepthRenderTargetFormat::kD24S8 ? "D24S8" : "D24FS8",
                         depth.depth_base | (depth.depth_base_bit_11 << 11),
-                        depth_control.z_write_enable ? "" : "(read-only)");
+                        depth_control.z_write_enable ? "" : "(read-only)", stencil);
   }
   return text;
 }
@@ -225,15 +249,19 @@ std::string DumpFloatConstants(const RegisterFile& regs, uint64_t pixel_shader_h
   return text;
 }
 
-void FrameLogRecordDraw(const RegisterFile& regs, const Shader* vertex_shader,
-                        const Shader* pixel_shader) {
+// Returns the index of the pass the draw starts, or UINT32_MAX if it continues
+// one (or nothing is recorded).
+uint32_t FrameLogRecordDraw(const RegisterFile& regs, const Shader* vertex_shader,
+                            const Shader* pixel_shader) {
   FrameLog& log = GetFrameLog();
   if (!log.recording) {
-    return;
+    return UINT32_MAX;
   }
   bool resolve = regs.Get<reg::RB_MODECONTROL>().edram_mode == EdramMode::kCopy;
   std::string target = resolve ? DescribeResolve(regs) : DescribeRenderTargets(regs);
+  uint32_t new_pass = UINT32_MAX;
   if (resolve || log.passes.empty() || log.passes.back().target != target) {
+    new_pass = uint32_t(log.passes.size());
     log.passes.push_back({std::move(target)});
   }
   FrameLogPass& pass = log.passes.back();
@@ -249,31 +277,80 @@ void FrameLogRecordDraw(const RegisterFile& regs, const Shader* vertex_shader,
       pass.constant_dumps.push_back(DumpFloatConstants(regs, pixel_hash));
     }
   }
+  return new_pass;
 }
 
-// Called at each guest frame swap: starts recording when gpu_frame_log is set,
-// and writes the file at the end of the recorded frame.
-void FrameLogOnSwap() {
+// Called at each guest frame swap: starts recording when gpu_frame_log is set.
+// Returns whether the recorded frame ends here (then FrameLogWrite after the
+// swap), with the number of its passes.
+bool FrameLogOnSwap(uint32_t& pass_count_out) {
   FrameLog& log = GetFrameLog();
   if (!log.recording) {
     const std::string& path = REXCVAR_GET(gpu_frame_log);
     if (!path.empty()) {
       log.path = path;
       log.passes.clear();
+      log.markers.clear();
       log.recording = true;
     }
-    return;
+    return false;
   }
   log.recording = false;
+  pass_count_out = uint32_t(log.passes.size());
+  return true;
+}
+
+uint32_t FrameLogMarkerCount() {
+  return uint32_t(GetFrameLog().markers.size());
+}
+
+// Writes the recorded frame; timestamps_ms (if any) = where each pass, then
+// the swap, starts and the swap ends, then where each marker starts, in
+// milliseconds.
+void FrameLogWrite(const std::vector<double>& timestamps_ms) {
+  FrameLog& log = GetFrameLog();
+  size_t pass_count = log.passes.size();
+  bool timed = timestamps_ms.size() == pass_count + 2 + log.markers.size();
+  auto pass_ms = [&](size_t i) { return timestamps_ms[i + 1] - timestamps_ms[i]; };
+  // A marker lasts until the next one in its pass, or the pass's end.
+  auto marker_ms = [&](size_t i) {
+    double end = timestamps_ms[log.markers[i].pass + 1];
+    if (i + 1 < log.markers.size() && log.markers[i + 1].pass == log.markers[i].pass) {
+      end = timestamps_ms[pass_count + 2 + i + 1];
+    }
+    return end - timestamps_ms[pass_count + 2 + i];
+  };
   if (std::FILE* file = std::fopen(log.path.c_str(), "w")) {
     uint32_t total_draws = 0;
     for (const FrameLogPass& pass : log.passes) {
       total_draws += pass.draws;
     }
-    fmt::print(file, "{} passes/resolves, {} draws\n", log.passes.size(), total_draws);
-    for (size_t i = 0; i < log.passes.size(); ++i) {
+    fmt::print(file, "{} passes/resolves, {} draws\n", pass_count, total_draws);
+    if (timed) {
+      // The GPU time of each pass - until the next one starts (draws, the
+      // render target transfers and resolves before them).
+      fmt::print(file, "GPU: frame {:.2f} ms ({:.2f} ms passes, {:.2f} ms swap)\n",
+                 timestamps_ms[pass_count + 1] - timestamps_ms[0],
+                 timestamps_ms[pass_count] - timestamps_ms[0], pass_ms(pass_count));
+      std::vector<size_t> order(pass_count);
+      for (size_t i = 0; i < pass_count; ++i) {
+        order[i] = i;
+      }
+      std::sort(order.begin(), order.end(),
+                [&](size_t a, size_t b) { return pass_ms(a) > pass_ms(b); });
+      fmt::print(file, "The longest:\n");
+      for (size_t j = 0; j < std::min(pass_count, size_t(20)); ++j) {
+        fmt::print(file, "  [{}] {:.3f} ms draws={} {}\n", order[j], pass_ms(order[j]),
+                   log.passes[order[j]].draws, log.passes[order[j]].target);
+      }
+    }
+    for (size_t i = 0; i < pass_count; ++i) {
       const FrameLogPass& pass = log.passes[i];
-      fmt::print(file, "[{}] draws={} {}\n", i, pass.draws, pass.target);
+      if (timed) {
+        fmt::print(file, "[{}] {:.3f} ms draws={} {}\n", i, pass_ms(i), pass.draws, pass.target);
+      } else {
+        fmt::print(file, "[{}] draws={} {}\n", i, pass.draws, pass.target);
+      }
       std::vector<std::pair<std::pair<uint64_t, uint64_t>, uint32_t>> shaders(
           pass.shaders.begin(), pass.shaders.end());
       std::sort(shaders.begin(), shaders.end(),
@@ -281,6 +358,23 @@ void FrameLogOnSwap() {
       for (size_t j = 0; j < shaders.size(); ++j) {
         fmt::print(file, "      vs={:016X} ps={:016X} x{}\n", shaders[j].first.first,
                    shaders[j].first.second, shaders[j].second);
+      }
+      for (const std::string& note : pass.notes) {
+        fmt::print(file, "      * {}\n", note);
+      }
+      if (timed) {
+        bool first = true;
+        for (size_t m = 0; m < log.markers.size(); ++m) {
+          if (log.markers[m].pass != i) {
+            continue;
+          }
+          if (first) {
+            fmt::print(file, "      ~ {:.3f} ms (the pass's own work)\n",
+                       timestamps_ms[pass_count + 2 + m] - timestamps_ms[i]);
+            first = false;
+          }
+          fmt::print(file, "      ~ {:.3f} ms {}\n", marker_ms(m), log.markers[m].name);
+        }
       }
       for (const std::string& dump : pass.constant_dumps) {
         std::fputs(dump.c_str(), file);
@@ -296,6 +390,27 @@ void FrameLogOnSwap() {
 }
 
 }  // namespace
+
+void CommandProcessor::FrameLogMarker(const char* name) {
+  FrameLog& log = GetFrameLog();
+  if (!log.recording || log.passes.empty() || log.markers.size() >= kFrameLogMarkerCount) {
+    return;
+  }
+  uint32_t index = kFrameLogMarkerBase + uint32_t(log.markers.size());
+  log.markers.push_back({uint32_t(log.passes.size() - 1), name});
+  FrameLogTimestamp(index);
+}
+
+void CommandProcessor::FrameLogNote(std::string note) {
+  FrameLog& log = GetFrameLog();
+  if (!log.recording) {
+    return;
+  }
+  if (log.passes.empty()) {
+    log.passes.push_back({"(before the first draw)"});
+  }
+  log.passes.back().notes.push_back(std::move(note));
+}
 
 namespace {
 
@@ -1241,9 +1356,21 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  FrameLogOnSwap();
+  uint32_t frame_log_passes = 0;
+  bool frame_log_done = FrameLogOnSwap(frame_log_passes);
+  if (frame_log_done) {
+    FrameLogTimestamp(frame_log_passes);
+  }
   scene_lights::OnFrameSwap();
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  if (frame_log_done) {
+    FrameLogTimestamp(frame_log_passes + 1);
+    std::vector<double> timestamps_ms;
+    if (!FrameLogReadTimestamps(frame_log_passes + 2, FrameLogMarkerCount(), timestamps_ms)) {
+      timestamps_ms.clear();
+    }
+    FrameLogWrite(timestamps_ms);
+  }
 
   ++counter_;
   return true;
@@ -1690,7 +1817,11 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      FrameLogRecordDraw(*register_file_, active_vertex_shader_, active_pixel_shader_);
+      uint32_t frame_log_pass =
+          FrameLogRecordDraw(*register_file_, active_vertex_shader_, active_pixel_shader_);
+      if (frame_log_pass != UINT32_MAX && frame_log_pass + 2 < kFrameLogMarkerBase) {
+        FrameLogTimestamp(frame_log_pass);
+      }
       scene_lights::OnDraw(*register_file_, active_pixel_shader_);
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);

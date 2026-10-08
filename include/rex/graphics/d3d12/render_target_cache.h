@@ -245,6 +245,13 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
 
+    // The stencil bits that may be set anywhere in the render target (created
+    // zeroed): what draws, clears and transfers into it may have written.
+    // Transfers from it copy only these - without SV_StencilRef, every bit is
+    // a full-screen pass.
+    uint32_t stencil_bits_maybe_set() const { return stencil_bits_maybe_set_; }
+    void AddStencilBitsMaybeSet(uint32_t bits) { stencil_bits_maybe_set_ |= bits & 0xFF; }
+
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw_;
@@ -260,6 +267,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     uint32_t temporary_srv_descriptor_index_ = UINT32_MAX;
     uint32_t temporary_srv_descriptor_index_stencil_ = UINT32_MAX;
     uint32_t temporary_sort_index_ = 0;
+    uint32_t stencil_bits_maybe_set_ = 0;
   };
 
   enum TransferCBVRegister : uint32_t {

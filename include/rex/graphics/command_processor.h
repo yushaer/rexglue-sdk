@@ -223,6 +223,30 @@ class CommandProcessor {
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
 
+  // gpu_frame_log: a GPU timestamp where each pass of the recorded frame
+  // starts (index = the pass; then the swap's start and end), and reading them
+  // back, in milliseconds from the first, once the frame is done (waiting for
+  // the GPU). Backends without timestamps keep the defaults.
+  // Named markers within passes (the SDK's own GPU work, like the scene
+  // effects) take the indices from kFrameLogMarkerBase.
+  static constexpr uint32_t kFrameLogMarkerBase = 2048;
+  static constexpr uint32_t kFrameLogMarkerCount = 2048;
+  virtual void FrameLogTimestamp(uint32_t /* index */) {}
+  // The pass timestamps 0 to pass_count - 1 then the markers', in
+  // milliseconds from the first.
+  virtual bool FrameLogReadTimestamps(uint32_t /* pass_count */, uint32_t /* marker_count */,
+                                      std::vector<double>& /* ms_out */) {
+    return false;
+  }
+
+ public:
+  // A note in the recorded frame's current pass (waits for the GPU and such).
+  void FrameLogNote(std::string note);
+  // A named part of the current pass from here on, timed on the GPU until the
+  // next marker or pass.
+  void FrameLogMarker(const char* name);
+
+ protected:
   // "Actual" is for the command processor thread, to be read by the
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
