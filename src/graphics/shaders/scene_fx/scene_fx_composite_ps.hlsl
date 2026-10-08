@@ -5,7 +5,7 @@
 // - Multiply: color *= (ambient occlusion + indirect light relative to the
 //   surface's brightness) * fog transmittance.
 // - Add: color += light the fog scatters toward the camera + volumetric
-//   lighting (light shafts).
+//   lighting (light shafts, sun rays, the glow of lamps and fires in the air).
 // - Debug: replaces the color with one effect.
 // The fog is exponential height fog integrated analytically per pixel at full
 // resolution (no ray marching), lit by the sky and with a glow toward the sun.
@@ -36,9 +36,13 @@ FX_EXTRA_CONSTANTS_BLOCK(9) {
   float4 fx_fog_color;
   // xyz = toward the sun (view space), w = Henyey-Greenstein anisotropy.
   float4 fx_fog_sun;
-  // rgb = sunlight scattered by the fog relative to the sky's color.
+  // rgb = sunlight scattered by the fog relative to the sky's color, w = how
+  // much the fog and the volumetric light cover the sky (the game's sky has
+  // its own haze: 1 would hide its blue).
   float4 fx_fog_sun_color;
-  // x = contact shadow strength, y = reflection intensity.
+  // x = contact shadow strength, y = reflection intensity, z = the glow of the
+  // game's lights in the air (0 = off), w = the reach of that glow, a share of
+  // the lights' radius.
   float4 fx_effect_strengths;
   // The game's local lights (scene_lights.h): x = count, y = time (seconds),
   // z = dynamic lighting strength (0 = off), w = embers' strength (0 = off).
@@ -153,6 +157,73 @@ float3 FxDynamicLights(int2 pixel, float2 screen, float distance) {
              (falloff * facing * FxLightVisibility(surface, to_light, light_distance, jitter));
   }
   return total;
+}
+
+// How much of a lamp shows, from 5 taps of the depth around where it is on
+// screen (fading out toward the screen's edges), and how bright it looks there
+// (the brightest of those taps in the half resolution scene). 0 behind the
+// camera.
+float2 FxLampOnScreen(float3 lamp) {
+  if (lamp.z <= 0.1) {
+    return 0.0;
+  }
+  float2 center = FxScreenFromView(lamp);
+  float2 edge = min(center, float2(fx_scene_size) - center) / (0.05 * float(fx_scene_size.y));
+  float on_screen = saturate(min(edge.x, edge.y));
+  if (on_screen <= 0.0) {
+    return 0.0;
+  }
+  float pixels_per_unit = 0.5 * float(fx_scene_size.y) / (lamp.z * fx_inv_p11);
+  float spread = max(0.08 * pixels_per_unit, 1.0);
+  static const float2 kTaps[5] = {float2(0.0, 0.0), float2(1.0, 0.0), float2(-1.0, 0.0),
+                                  float2(0.0, 1.0), float2(0.0, -1.0)};
+  int2 half_size = int2((fx_scene_size + 1) >> 1);
+  float visible = 0.0;
+  float brightness = 0.0;
+  [unroll] for (int i = 0; i < 5; ++i) {
+    float2 tap = center + kTaps[i] * spread;
+    // In front of whatever is there - the lamp's own glass, flame or wick is
+    // around it, so a little behind still counts.
+    visible += FxLoadDistance(int2(tap)) >= lamp.z - 0.25 ? 0.2 : 0.0;
+    int2 half_texel = clamp(int2(tap * 0.5), int2(0, 0), half_size - 1);
+    brightness = max(brightness, FxLuminance(fx_scene_color.Load(int3(half_texel, 0)).rgb));
+  }
+  return float2(visible * on_screen, min(brightness, 16.0));
+}
+
+// The light the game's lamps and fires scatter toward the camera in the air
+// between it and the surface (or the sky): per light, inverse-square from it,
+// integrated along the view ray analytically, fading out within a share of its
+// radius - as bright as the lamp looks on screen, and none from lamps hidden
+// behind something.
+float3 FxLightGlow(float2 screen, float distance) {
+  float3 direction = normalize(FxViewPosition(screen, 1.0));
+  float ray_length = distance / direction.z;
+  float3 total = 0.0;
+  uint count = uint(fx_lights_info.x);
+  [loop] for (uint i = 0; i < count; ++i) {
+    float4 light = fx_lights[i * 2u];
+    float reach = fx_effect_strengths.w * light.w;
+    // Closest approach of the view ray (s along it), at miss from the light.
+    float along = dot(light.xyz, direction);
+    float miss = length(direction * along - light.xyz);
+    if (miss >= reach || ray_length <= 0.0) {
+      continue;
+    }
+    float2 lamp = FxLampOnScreen(light.xyz);
+    if (lamp.x <= 0.0) {
+      continue;
+    }
+    // Softened in the middle - the lamp itself is there.
+    float core = max(miss, 0.1 * reach);
+    // Integral over s from 0 to the surface of 1 / (core^2 + (s - along)^2).
+    float scattering = (atan((ray_length - along) / core) - atan(-along / core)) / core;
+    float window = 1.0 - miss / reach;
+    float3 color = fx_lights[i * 2u + 1u].rgb;
+    total += color / max(FxLuminance(color), 1.0e-3) *
+             (lamp.x * lamp.y * scattering * window * window * reach);
+  }
+  return total * (fx_effect_strengths.z * 0.004);
 }
 
 float FxHash(float2 p) {
@@ -272,7 +343,8 @@ float4 main(float4 position : SV_Position) : SV_Target {
   if (fx_effect_flags & FX_EFFECT_FOG) {
     float3 direction = normalize(FxViewPosition(screen, 1.0));
     float distance = is_sky ? fx_fog_color.w : depth / direction.z;
-    fog_transmittance = exp(-FxFogOpticalDepth(direction, distance));
+    fog_transmittance =
+        exp(-FxFogOpticalDepth(direction, distance) * (is_sky ? fx_fog_sun_color.w : 1.0));
     float g = fx_fog_sun.w;
     float phase = (1.0 - g * g) /
                   pow(max(1.0 + g * g - 2.0 * g * dot(direction, fx_fog_sun.xyz), 1.0e-4), 1.5);
@@ -290,6 +362,9 @@ float4 main(float4 position : SV_Position) : SV_Target {
       }
       shafts *= inv_weight_sum;
     }
+    if (is_sky) {
+      shafts *= fx_fog_sun_color.w;
+    }
   }
   // On the surface, so seen through the fog.
   float3 reflections = 0.0;
@@ -298,12 +373,17 @@ float4 main(float4 position : SV_Position) : SV_Target {
     FX_UPSAMPLE(fx_reflections, reflection)
     reflections = reflection.rgb * (fx_effect_strengths.y * fog_transmittance);
   }
+  float3 glow = 0.0;
+  if (fx_composite_mode != FX_COMPOSITE_MULTIPLY && fx_effect_strengths.z > 0.0 &&
+      fx_lights_info.x > 0.0) {
+    glow = FxLightGlow(screen, is_sky ? fx_sky_distance : depth) * fog_transmittance;
+  }
   if (fx_composite_mode == FX_COMPOSITE_ADD) {
     float3 embers = 0.0;
     if (fx_lights_info.w > 0.0 && fx_lights_info.x > 0.0) {
       embers = FxEmbers(screen, depth);
     }
-    return float4(fog_light + shafts + reflections + embers, 0.0);
+    return float4(fog_light + shafts + glow + reflections + embers, 0.0);
   }
 
   float contact = 1.0;
@@ -365,7 +445,8 @@ float4 main(float4 position : SV_Position) : SV_Target {
     return float4(ao, ao, ao, 1.0);
   }
   if (fx_debug_mode == FX_DEBUG_VOLUMETRICS) {
-    return float4(shafts / (1.0 + shafts), 1.0);
+    float3 volumetric = shafts + glow;
+    return float4(volumetric / (1.0 + volumetric), 1.0);
   }
   if (fx_debug_mode == FX_DEBUG_GI) {
     return float4(indirect / (1.0 + indirect), 1.0);

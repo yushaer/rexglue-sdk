@@ -33,6 +33,10 @@
     /* Contact shadows: x = ray length, y = thickness, z = step count,          \
        w = strength. */                                                         \
     float4 fx_sun_contact;                                                         \
+    /* Volumetric lighting: x = shaft contrast (0 = physical), y = sun ray      \
+       strength (0 = off), z = sun ray length (share of the way to the sun),    \
+       w = how far back along the ray the contrast looks, world units. */       \
+    float4 fx_sun_rays;                                                            \
   };
 
 // Fraction of the sun reaching the position through the cascade, filtered over

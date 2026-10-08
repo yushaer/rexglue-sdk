@@ -340,6 +340,8 @@ class SceneEffects {
   // the heat haze is over (view space position xyz).
   bool dynamic_lights_active_ = false;
   bool embers_active_ = false;
+  // The lights glow in the air (volumetric lighting).
+  bool glow_active_ = false;
   static constexpr uint32_t kMaxHazeFlames = 4;
   float haze_flames_[kMaxHazeFlames][3] = {};
   uint32_t haze_flame_count_ = 0;

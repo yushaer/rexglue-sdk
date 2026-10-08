@@ -492,9 +492,14 @@ void EffectsDialog::OnDraw(ImGuiIO& /*io*/) {
     ImGui::PushID("volumetrics");
     Description(
         "Light shafts: sunlight scattering in the air, shadowed by the game's own sun shadows "
-        "- through buildings, trees and windows.");
+        "- through buildings, trees and windows. Rays from the sun when it's in view, and the "
+        "glow of the air around lamps and fires.");
     ComboCvar("Quality", "scene_fx_volumetrics_quality", kQualities, kQualityValues, 4);
     SliderCvar("Brightness", "scene_fx_volumetrics_intensity", 0.0f, 4.0f);
+    SliderCvar("Shaft contrast", "scene_fx_volumetrics_contrast", 0.0f, 1.0f);
+    SliderCvar("Sun rays", "scene_fx_volumetrics_sun_rays", 0.0f, 4.0f);
+    SliderCvar("Lamp and fire glow", "scene_fx_volumetrics_lights", 0.0f, 8.0f);
+    SliderCvar("Glow reach", "scene_fx_volumetrics_lights_reach", 0.05f, 1.0f);
     SliderCvar("Haze", "scene_fx_volumetrics_density", 0.0f, 0.03f, "%.4f",
                ImGuiSliderFlags_Logarithmic);
     SliderCvar("Glow toward the sun", "scene_fx_volumetrics_anisotropy", 0.0f, 0.95f);
@@ -519,6 +524,7 @@ void EffectsDialog::OnDraw(ImGuiIO& /*io*/) {
                ImGuiSliderFlags_Logarithmic);
     SliderCvar("Brightness", "scene_fx_fog_brightness", 0.0f, 2.0f);
     SliderCvar("Sun glow", "scene_fx_fog_sun_glow", 0.0f, 2.0f);
+    SliderCvar("Over the sky", "scene_fx_fog_sky", 0.0f, 1.0f);
     ImGui::PopID();
   }
 

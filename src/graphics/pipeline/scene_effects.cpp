@@ -99,7 +99,7 @@ REXCVAR_DEFINE_BOOL(scene_fx_volumetrics, true, "GPU/Effects",
 REXCVAR_DEFINE_INT32(scene_fx_volumetrics_quality, 2, "GPU/Effects",
                      "Volumetric lighting quality: 0 = low, 1 = medium, 2 = high, 3 = ultra")
     .range(0, 3) REX_SCENE_FX_LIVE;
-REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_intensity, 1.0, "GPU/Effects",
+REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_intensity, 2.5, "GPU/Effects",
                       "Light shaft brightness, relative to the sky's")
     .range(0.0, 8.0) REX_SCENE_FX_LIVE;
 REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_density, 0.004, "GPU/Effects",
@@ -111,6 +111,23 @@ REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_anisotropy, 0.6, "GPU/Effects",
 REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_distance, 120.0, "GPU/Effects",
                       "Distance the light shafts extend to, in world units")
     .range(10.0, 1000.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_contrast, 0.92, "GPU/Effects",
+                      "How much the light shafts stand out from the sunlit air around them: 0 = "
+                      "physical (air in the sun all along the view glows evenly, like fog), 1 = "
+                      "only where the light crosses shadow")
+    .range(0.0, 1.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_sun_rays, 0.6, "GPU/Effects",
+                      "Rays streaming from the sun around what's in front of it, with the sun on "
+                      "or near the screen (0 = off)")
+    .range(0.0, 4.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_volumetrics_lights, 1.0, "GPU/Effects",
+                      "Glow of the air around the game's lamps and fires (0 = off)")
+    .range(0.0, 8.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(
+    scene_fx_volumetrics_lights_reach, 0.25, "GPU/Effects",
+    "How far the glow around lamps and fires reaches, as a share of their light's "
+    "radius")
+    .range(0.05, 1.0) REX_SCENE_FX_LIVE;
 REXCVAR_DEFINE_BOOL(scene_fx_volumetrics_temporal, true, "GPU/Effects",
                     "Accumulate the light shafts over frames (smoother, less noise)")
     REX_SCENE_FX_LIVE;
@@ -145,6 +162,10 @@ REXCVAR_DEFINE_DOUBLE(scene_fx_fog_sun_glow, 0.5, "GPU/Effects",
 REXCVAR_DEFINE_DOUBLE(scene_fx_fog_distance, 1000.0, "GPU/Effects",
                       "Distance of the sky through the fog, in world units")
     .range(50.0, 20000.0) REX_SCENE_FX_LIVE;
+REXCVAR_DEFINE_DOUBLE(scene_fx_fog_sky, 0.3, "GPU/Effects",
+                      "How much the fog and the volumetric light cover the sky (the game's sky has "
+                      "its own haze - 1 hides its blue)")
+    .range(0.0, 1.0) REX_SCENE_FX_LIVE;
 
 // Image.
 REXCVAR_DEFINE_BOOL(scene_fx_sharpen, false, "GPU/Effects",
@@ -261,6 +282,7 @@ struct SunConstants {
   float tint[4];
   float fog[4];
   float contact[4];
+  float rays[4];
 };
 
 struct TemporalConstants {
@@ -651,7 +673,7 @@ void SceneEffects::OnResolve() {
       ComputeEffects(*source_rt, rect, screen_offset_x, screen_offset_y, trace);
     }
     if (REXCVAR_GET(scene_fx_gi) || REXCVAR_GET(scene_fx_reflections) || dynamic_lights_active_ ||
-        embers_active_) {
+        embers_active_ || glow_active_) {
       CaptureSceneColor(*source_rt, rect, screen_offset_x, screen_offset_y);
     }
     if (debug_mode > kDebugSplit) {
@@ -663,7 +685,8 @@ void SceneEffects::OnResolve() {
       Composite(*source_rt, rect, screen_offset_x, screen_offset_y, 1.0f, 1.0f,
                 Draw::kCompositeMultiply, trace);
     }
-    if (fog_enabled_ || volumetrics_computed_ || reflections_computed_ || embers_active_) {
+    if (fog_enabled_ || volumetrics_computed_ || reflections_computed_ || embers_active_ ||
+        glow_active_) {
       Composite(*source_rt, rect, screen_offset_x, screen_offset_y, 1.0f, 1.0f,
                 Draw::kCompositeAdd, trace);
     }
@@ -1048,7 +1071,8 @@ void SceneEffects::FillSunConstants(const CameraBasis& basis, void* constants_ou
     sc.cascade_size[i][1] = float(cascade.height);
   }
   GetHeightRow(basis, sc.height);
-  GetSunDirection(basis, sc.direction);
+  // Sun rays only toward where the shadows say the sun is.
+  bool sun_known = GetSunDirection(basis, sc.direction);
   sc.direction[3] = float(REXCVAR_GET(scene_fx_volumetrics_anisotropy));
   sc.volumetric[0] = float(REXCVAR_GET(scene_fx_volumetrics_distance));
   sc.volumetric[1] =
@@ -1067,6 +1091,10 @@ void SceneEffects::FillSunConstants(const CameraBasis& basis, void* constants_ou
   sc.contact[1] = float(REXCVAR_GET(scene_fx_contact_shadows_thickness));
   sc.contact[2] = float(kContactShadowStepCount);
   sc.contact[3] = float(REXCVAR_GET(scene_fx_contact_shadows_strength));
+  sc.rays[0] = float(REXCVAR_GET(scene_fx_volumetrics_contrast));
+  sc.rays[1] = sun_known ? float(REXCVAR_GET(scene_fx_volumetrics_sun_rays)) : 0.0f;
+  sc.rays[2] = 0.7f;   // of the way to the sun
+  sc.rays[3] = 10.0f;  // world units the contrast remembers
   std::memcpy(constants_out, &sc, sizeof(sc));
 }
 
@@ -1264,6 +1292,9 @@ bool SceneEffects::FillFogConstants() {
   std::memset(composite_constants_, 0, sizeof(composite_constants_));
   composite_constants_[5][0] = float(REXCVAR_GET(scene_fx_contact_shadows_strength));
   composite_constants_[5][1] = float(REXCVAR_GET(scene_fx_reflections_intensity));
+  composite_constants_[5][2] =
+      REXCVAR_GET(scene_fx_volumetrics) ? float(REXCVAR_GET(scene_fx_volumetrics_lights)) : 0.0f;
+  composite_constants_[5][3] = float(REXCVAR_GET(scene_fx_volumetrics_lights_reach));
   CameraBasis basis;
   if (!camera_.has_matrix || !GetCameraBasis(camera_.rows, basis)) {
     return false;
@@ -1286,20 +1317,25 @@ bool SceneEffects::FillFogConstants() {
   for (uint32_t i = 0; i < 3; ++i) {
     composite_constants_[4][i] = tint[i] * glow;
   }
+  composite_constants_[4][3] = float(REXCVAR_GET(scene_fx_fog_sky));
   return true;
 }
 
 void SceneEffects::FillLightConstants() {
   dynamic_lights_active_ = false;
   embers_active_ = false;
+  glow_active_ = false;
   haze_flame_count_ = 0;
   float(&info)[4] = composite_constants_[kCompositeLightRow];
   std::memset(&composite_constants_[kCompositeLightRow], 0,
               sizeof(float) * 4 * (1 + 2 * kMaxCompositeLights));
   bool dynamic_lights = REXCVAR_GET(scene_fx_dynamic_lights);
   bool fire = REXCVAR_GET(scene_fx_fire);
+  // The glow of the lights in the air (volumetric lighting).
+  bool glow = composite_constants_[5][2] > 0.0f;
   CameraBasis basis;
-  if ((!dynamic_lights && !fire) || !camera_.has_matrix || !GetCameraBasis(camera_.rows, basis)) {
+  if ((!dynamic_lights && !fire && !glow) || !camera_.has_matrix ||
+      !GetCameraBasis(camera_.rows, basis)) {
     return;
   }
   // In view space, those that can reach what's in view, nearest first.
@@ -1360,6 +1396,7 @@ void SceneEffects::FillLightConstants() {
   info[3] = fire && any_fire ? fire_intensity : 0.0f;
   dynamic_lights_active_ = dynamic_lights && intensity > 0.0f;
   embers_active_ = fire && any_fire && fire_intensity > 0.0f;
+  glow_active_ = glow;
   if (!fire || fire_intensity <= 0.0f) {
     haze_flame_count_ = 0;
   }
